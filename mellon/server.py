@@ -17,7 +17,7 @@ logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
-from mellon.store import store, revisions, graph_keys, placement, graph_path, Stale, library_entry
+from mellon.store import store, revisions, types, graph_keys, placement, graph_path, Stale, library_entry
 from mellon import remote
 from modules import MODULE_MAP
 from utils.huggingface import get_local_models, delete_model, search_hub, download_hub_model, get_local_model_ids
@@ -962,7 +962,7 @@ class WebServer:
         sid = graph['sid']
         nodes = graph['nodes']
         paths = graph['paths']
-        keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'])  # ours: every node's, whether or not this server runs it; a file by its content
+        keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'], types)  # ours: every node's, whether or not this server runs it; a file by its content
         status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": store.exists(k)} for i, k in keys.items()}}
         try:
             self._execute_paths(sid, paths, nodes, keys, status)

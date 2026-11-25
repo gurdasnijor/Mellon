@@ -65,23 +65,35 @@ def content(value, work_dir: Path):
     return {"sha256": _hashes[seen]}
 
 
-def graph_keys(nodes: dict, revisions: dict, work_dir: str | Path = ".") -> dict:
-    """Every node's key: SHA-256 of the JCS of {module, action, revision, params}; a link hashes its source's key, and
-    a file named here hashes its content."""
+def typed(value, kind: str | None):
+    """A value as DynamicBlockNode.execute casts it by its param's declared type, so 5 typed in the canvas, which it
+    posts as "5", keys as the 5 a graph loads; one that does not cast stays as sent."""
+    if kind not in ("int", "float") or value is None or isinstance(value, bool):
+        return value
+    try:
+        return int(value) if kind == "int" else float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def graph_keys(nodes: dict, revisions: dict, work_dir: str | Path = ".", types: dict | None = None) -> dict:
+    """Every node's key: SHA-256 of the JCS of {module, action, revision, params}; a link hashes its source's key, a
+    file named here hashes its content, and a value its folder declares int or float (types) hashes as cast."""
     keys = {}
 
     def key(node_id):
         if node_id not in keys:
             node, params = nodes[node_id], {}
+            repo_id = node["params"].get("repo_id", {}).get("value")
+            declared = (types or {}).get(repo_id, {})
             for name, p in node["params"].items():
                 if name in RUNNER or p.get("display", "").startswith("ui_"):
                     continue
                 params[name] = (
                     {"key": key(p["sourceId"]), "sourceKey": p["sourceKey"]}
                     if p.get("sourceId")
-                    else {"value": content(p.get("value"), Path(work_dir))}
+                    else {"value": content(typed(p.get("value"), declared.get(name)), Path(work_dir))}
                 )
-            repo_id = node["params"].get("repo_id", {}).get("value")
             body = {
                 "module": node["module"],
                 "action": node["action"],
@@ -304,12 +316,19 @@ def revision(folder: Path) -> str:
     return digest.hexdigest()
 
 
+def numbers(folder: Path) -> dict:
+    """The params of a folder's node that execute casts to a number (int or float), which its key casts the same."""
+    config = folder / CONFIG
+    types = runs(json.loads(config.read_bytes()))["types"] if config.exists() else {}
+    return {name: kind for name, kind in types.items() if kind in ("int", "float")}
+
+
 if __name__ == "__main__":  # python mellon/store.py nodes.json blocks/*: the revisions, the rest of the file kept
     import sys
 
     out = Path(sys.argv[1])
     kept = json.loads(out.read_text()) if out.exists() else {}
-    nodes = {f: {"revision": revision(Path(f))} for f in sys.argv[2:]}
+    nodes = {f: {"revision": revision(Path(f)), "types": numbers(Path(f))} for f in sys.argv[2:]}
     out.write_text(json.dumps({**kept, "nodes": nodes}, indent=2) + "\n")
 
 store = Store(
@@ -318,6 +337,7 @@ store = Store(
 )
 _nodes = json.loads(Path(os.environ["MELLON_NODES"]).read_text()) if os.environ.get("MELLON_NODES") else {}
 revisions = {repo: n["revision"] for repo, n in _nodes.get("nodes", {}).items()}
+types = {repo: n.get("types", {}) for repo, n in _nodes.get("nodes", {}).items()}
 # Where a folder's node runs when not here: "modal:<app>/<class>", whose run_graph runs it (mellon/remote.py). Not in
 # a key, so moving a node between hosts never changes one.
 placement = _nodes.get("placement", {})
