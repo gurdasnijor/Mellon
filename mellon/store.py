@@ -184,6 +184,21 @@ def render_path(saved: str | None, when: float) -> str:
     return f"graphs/{name}/renders/{stamp}.json" if name else f"graphs/renders/{stamp}.json"
 
 
+def render_videos(canvas: dict) -> tuple[list, list]:
+    """A render's video outputs as (node id, output) pairs: its finished videos, those of the nodes nothing reads from
+    (Assemble's), and its takes, those of the nodes placed elsewhere (Render's)."""
+    read_from = {e.get("source") for e in canvas.get("edges", [])}
+
+    def videos(node):
+        params = node.get("data", {}).get("params", {})
+        return [(node["id"], n) for n, p in params.items() if p.get("display") == "output" and p.get("type") == "video"]
+
+    nodes = canvas.get("nodes", [])
+    finished = [v for n in nodes if n["id"] not in read_from for v in videos(n)]
+    placed = [n for n in nodes if placement.get(n.get("data", {}).get("params", {}).get("repo_id", {}).get("value"))]
+    return finished, [v for n in placed for v in videos(n) if v not in finished]
+
+
 class Store:
     def __init__(self, url: str | None, local: str | Path):
         self.fs, self.root = fsspec.core.url_to_fs(url) if url else (None, None)
@@ -263,6 +278,45 @@ class Store:
             return []
         base = f"{self.root}/graphs/"
         return sorted(f[len(base) :] for f in self.fs.find(base) if f.endswith(".json"))
+
+    def renders(self) -> list[dict]:
+        """Every render kept with its run's keys, newest first: where it is saved, the graph it was opened from, when it
+        ran, and its videos as the store has them now, the finished ones if any is stored, else the takes stored so
+        far. A render kept without keys (before they were kept) is left out."""
+        saved = [g for g in self.graphs() if g.startswith("renders/") or "/renders/" in g]
+        if not saved:
+            return []
+        data = self.fs.cat([f"{self.root}/graphs/{g}" for g in saved])
+        canvases = {g: json.loads(data[f"{self.root}/graphs/{g}"]) for g in saved}
+        canvases = {g: c for g, c in canvases.items() if isinstance(c.get("keys"), dict)}
+        wanted = {g: render_videos(c) for g, c in canvases.items()}
+        keys = {canvases[g]["keys"].get(i) for g, (f, t) in wanted.items() for i, _ in f + t} - {None}
+        with ThreadPoolExecutor(32) as pool:  # one GET each, all at once, as read() does, leaving its pass alone
+            found = {k: json.loads(d) for k, d in zip(keys, pool.map(self._entry, keys)) if d is not None}
+        renders = []
+        for g, canvas in canvases.items():
+            labels = {n["id"]: n.get("data", {}).get("label") for n in canvas["nodes"]}
+
+            def stored(pairs):
+                out = []
+                for node, name in pairs:
+                    value = found.get(canvas["keys"].get(node), {}).get(name)
+                    for ref in value if isinstance(value, list) else [value]:
+                        if isinstance(ref, dict) and set(ref) == {"file"}:
+                            out.append({"node": node, "label": labels[node], "file": f"store:{ref['file']}"})
+                return out
+
+            finished, takes = wanted[g]
+            done = stored(finished)
+            folder, _, stamp = g.rpartition("renders/")
+            renders.append({
+                "path": f"store:graphs/{g}",
+                "graph": folder.rstrip("/") or None,
+                "time": stamp.removesuffix(".json"),
+                "finished": bool(done),
+                "videos": done or stored(takes),
+            })
+        return sorted(renders, key=lambda r: r["time"], reverse=True)
 
     def _etag(self, path: str, data: bytes | None = None) -> str:
         """The object's ETag; a folder's is the MD5 its bytes would have as one S3 put, which is R2's."""

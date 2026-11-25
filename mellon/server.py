@@ -96,6 +96,7 @@ class WebServer:
             web.get('/listdir', self.listdir),
             web.get('/listgraphs', self.listgraphs),
             web.put('/graphs/{path:.+}', self.save_graph),
+            web.get('/renders', self.renders),
             web.get('/file', self.fileGet),
             web.post('/file', self.filePost),
             web.get('/preview', self.preview),
@@ -778,6 +779,10 @@ class WebServer:
 
         return web.json_response(tree)
 
+    async def renders(self, request):
+        """ours: the renders kept as saved graphs, newest first, each with its videos in the store (the Gallery)."""
+        return web.json_response(await asyncio.to_thread(store.renders) if store.fs else [])
+
     async def fileGet(self, request):
         file = request.query.get('file')
 
@@ -985,7 +990,7 @@ class WebServer:
         # beside the composition it was opened from; its keys find its takes
         placed = [i for path in paths for i in path if placement.get(nodes[i]['params'].get('repo_id', {}).get('value'))]
         if graph.get('canvas') and store.fs and any(not status['nodes'][i]['stored'] for i in placed):
-            store.save_graph(render_path(graph.get('saved'), time.time()), json.dumps(graph['canvas']).encode(), None)
+            store.save_graph(render_path(graph.get('saved'), time.time()), json.dumps({**graph['canvas'], 'keys': keys}).encode(), None)  # and its keys, which find its videos (/renders)
         try:
             self._execute_paths(sid, paths, nodes, keys, status)
         except Exception as e:
