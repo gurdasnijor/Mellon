@@ -30,19 +30,26 @@ FILES = ("video", "image", "file")
 _hashes: dict = {}  # a file's SHA-256 by (path, size, mtime), so an unchanged file is read once per process
 
 
+def file_here(value, work_dir: Path) -> Path | None:
+    """The file on this machine a param's string names, relative to work_dir or absolute; None for any other value
+    (a prompt is a string too, and may be too long to be a path)."""
+    if not isinstance(value, str) or not value or "://" in value:
+        return None
+    path = Path(value) if Path(value).is_absolute() else Path(work_dir) / value
+    try:
+        return path if path.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
 def content(value, work_dir: Path):
-    """A param's value with each string that names a file here (relative to work_dir, or absolute) as {"sha256": …}."""
+    """A param's value with each string that names a file here as {"sha256": …}."""
     if isinstance(value, list):
         return [content(v, work_dir) for v in value]
-    if not isinstance(value, str) or not value or "://" in value:
+    path = file_here(value, work_dir)
+    if path is None:
         return value
-    path = Path(value) if Path(value).is_absolute() else work_dir / value
-    try:
-        stat = path.stat()
-    except (OSError, ValueError):
-        return value
-    if not path.is_file():
-        return value
+    stat = path.stat()
     seen = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
     if seen not in _hashes:
         digest = hashlib.sha256()

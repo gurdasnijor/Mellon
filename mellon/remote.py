@@ -8,7 +8,7 @@ import os
 from copy import deepcopy
 from pathlib import Path
 
-from mellon.store import store
+from mellon.store import file_here, store
 
 WAIT = 10  # seconds between looks at whether the server was asked to stop
 
@@ -30,14 +30,12 @@ def upstream(nodes: dict, node_id: str) -> list[str]:
 
 
 def stored_inputs(value, key: str, name: str, work_dir: Path, index):
-    """A param's value with each file on this machine it names (as store.content finds them) put in the store under
-    the node's key and named by its ref, so the host it runs on reads it."""
+    """A param's value with each file on this machine it names (those the key hashes) put in the store under the
+    node's key and named by its ref, so the host it runs on reads it."""
     if isinstance(value, list):
         return [stored_inputs(v, key, name, work_dir, index) for v in value]
-    if not isinstance(value, str) or not value or "://" in value:
-        return value
-    path = Path(value) if Path(value).is_absolute() else work_dir / value
-    if not path.is_file():
+    path = file_here(value, work_dir)
+    if path is None:
         return value
     ref = f"nodes/{key}/inputs/{name}/{next(index)}{path.suffix}"
     store.fs.makedirs(os.path.dirname(f"{store.root}/{ref}"), exist_ok=True)
