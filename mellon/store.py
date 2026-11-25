@@ -2,7 +2,9 @@
 URL (s3://<bucket>/<prefix>, its endpoint and key in the environment). A node's outputs are nodes/<key>.json under it,
 its files under nodes/<key>/. A file in a value is {"file": "<ref>"}, a path under the root: one another program put
 there, or a stored node's own, such as nodes/<key>/depth_videos/0.mp4. MELLON_NODES names a JSON file of each node
-folder's revision, which `python mellon/store.py blocks/*` prints."""
+folder's revision, which `python mellon/store.py blocks/*` prints. A value naming a file on this machine, such as a file
+field's path under Mellon's work folder, keys by the file's content: the same path with other bytes is another key, and
+the same bytes under another name or on another host are the same one."""
 
 import hashlib
 import json
@@ -24,8 +26,35 @@ MELLON = "mellon@5fd24292"  # the revision of a node that is not a folder: Mello
 FILES = ("video", "image", "file")
 
 
-def graph_keys(nodes: dict, revisions: dict) -> dict:
-    """Every node's key: SHA-256 of the JCS of {module, action, revision, params}; a link hashes its source's key."""
+_hashes: dict = {}  # a file's SHA-256 by (path, size, mtime), so an unchanged file is read once per process
+
+
+def content(value, work_dir: Path):
+    """A param's value with each string that names a file here (relative to work_dir, or absolute) as {"sha256": …}."""
+    if isinstance(value, list):
+        return [content(v, work_dir) for v in value]
+    if not isinstance(value, str) or not value or "://" in value:
+        return value
+    path = Path(value) if Path(value).is_absolute() else work_dir / value
+    try:
+        stat = path.stat()
+    except (OSError, ValueError):
+        return value
+    if not path.is_file():
+        return value
+    seen = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    if seen not in _hashes:
+        digest = hashlib.sha256()
+        with path.open("rb") as f:
+            while chunk := f.read(1 << 20):
+                digest.update(chunk)
+        _hashes[seen] = digest.hexdigest()
+    return {"sha256": _hashes[seen]}
+
+
+def graph_keys(nodes: dict, revisions: dict, work_dir: str | Path = ".") -> dict:
+    """Every node's key: SHA-256 of the JCS of {module, action, revision, params}; a link hashes its source's key, and
+    a file named here hashes its content."""
     keys = {}
 
     def key(node_id):
@@ -37,7 +66,7 @@ def graph_keys(nodes: dict, revisions: dict) -> dict:
                 params[name] = (
                     {"key": key(p["sourceId"]), "sourceKey": p["sourceKey"]}
                     if p.get("sourceId")
-                    else {"value": p.get("value")}
+                    else {"value": content(p.get("value"), Path(work_dir))}
                 )
             repo_id = node["params"].get("repo_id", {}).get("value")
             body = {

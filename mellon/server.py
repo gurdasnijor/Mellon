@@ -908,7 +908,7 @@ class WebServer:
         sid = graph['sid']
         nodes = graph['nodes']
         paths = graph['paths']
-        keys = graph_keys(nodes, revisions)  # ours: every node's, whether or not this server runs it
+        keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'])  # ours: every node's, whether or not this server runs it; a file by its content
         status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": store.exists(k)} for i, k in keys.items()}}
         try:
             self._execute_paths(sid, paths, nodes, keys, status)
