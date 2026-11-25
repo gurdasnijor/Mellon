@@ -987,10 +987,8 @@ class WebServer:
             found = store.read(keys.values())  # ours: every node's stored outputs in one pass, which refs() then answers from
             status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": found[k] is not None} for i, k in keys.items()}}
         # ours: a post that runs a node placed elsewhere (a render) is kept as a saved graph, the canvas as it was run,
-        # beside the composition it was opened from; its keys find its takes
-        placed = [i for path in paths for i in path if placement.get(nodes[i]['params'].get('repo_id', {}).get('value'))]
-        if graph.get('canvas') and store.fs and any(not status['nodes'][i]['stored'] for i in placed):
-            store.save_graph(render_path(graph.get('saved'), time.time()), json.dumps({**graph['canvas'], 'keys': keys}).encode(), None)  # and its keys, which find its videos (/renders)
+        # beside the composition it was opened from, at its first spawn (a skipped render keeps nothing); its keys find its takes
+        self.keep_render = (lambda: store.save_graph(render_path(graph.get('saved'), time.time()), json.dumps({**graph['canvas'], 'keys': keys}).encode(), None)) if graph.get('canvas') and store.fs else None  # and its keys, which find its videos (/renders)
         try:
             self._execute_paths(sid, paths, nodes, keys, status)
         except Exception as e:
@@ -1134,6 +1132,9 @@ class WebServer:
         refs = store.refs(key) if key else None
         place = placement.get(params.get('repo_id', {}).get('value')) if key and nodes and refs is None else None
         if place:  # ours: a node placed elsewhere (nodes.json) runs there, and its outputs are read from the store
+            if getattr(self, 'keep_render', None):
+                self.keep_render()
+                self.keep_render = None
             remote.run(place, id, nodes, keys, revisions[params['repo_id']['value']], CONFIG.paths['work_dir'], lambda: self.interrupt_flag)
             refs = store.refs(key)
             if refs is None:
