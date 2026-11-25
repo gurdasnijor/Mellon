@@ -59,7 +59,7 @@ def run(place: str, node_id: str, nodes: dict, keys: dict, revision: str, work_d
         called = store.fs.exists(marker)
         if not called:
             order = upstream(nodes, node_id)
-            missing = [i for i in order[:-1] if not store.exists(keys[i])]
+            missing = [i for i in order[:-1] if store.refs(keys[i]) is None]  # the run's read() has them
     if called:
         call = modal.FunctionCall.from_id(store.fs.cat_file(marker).decode())
     else:

@@ -979,7 +979,8 @@ class WebServer:
         with telemetry.timed(telemetry.store_s, op="check"):  # ours: the run's check, its keys and whether each is stored
             with telemetry.timed(telemetry.store_s, op="keys"):
                 keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'], types)  # ours: every node's, whether or not this server runs it; a file by its content
-            status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": store.exists(k)} for i, k in keys.items()}}
+            found = store.read(keys.values())  # ours: every node's stored outputs in one pass, which refs() then answers from
+            status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": found[k] is not None} for i, k in keys.items()}}
         # ours: a post that runs a node placed elsewhere (a render) is kept as a saved graph, the canvas as it was run,
         # beside the composition it was opened from; its keys find its takes
         placed = [i for path in paths for i in path if placement.get(nodes[i]['params'].get('repo_id', {}).get('value'))]
