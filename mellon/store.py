@@ -274,15 +274,33 @@ class Store:
         return {"file": ref}
 
 
+CONFIG = "mellon_pipeline_config.json"
+
+
+def runs(config: dict) -> dict:
+    """What of a folder's Mellon config can change its node's outputs: what DynamicBlockNode.execute reads (the dtype,
+    the names of the inputs it passes, the outputs it returns and the models, and the params' types it casts by) and
+    the outputs' types, which the store reads. Not labels, display, defaults, options or order, which only the canvas
+    reads: a folder's node skips Mellon's param checks, so the value the canvas sends is what the block gets, and that
+    value is in the key."""
+    custom = config.get("node_params", {}).get("custom", {})
+    names = {kind: custom.get(kind, []) for kind in ("input_names", "output_names", "model_input_names")}
+    params = custom.get("params", {})
+    types = {name: params.get(name, {}).get("type") for kind in names.values() for name in kind}
+    return {"default_dtype": config.get("default_dtype"), **names, "types": types}
+
+
 def revision(folder: Path) -> str:
-    """A folder's content, as its loader reads it: the key's stand-in for a Hub commit."""
+    """What runs in a folder, as its loader reads it: the key's stand-in for a Hub commit. Every file byte for byte but
+    Markdown, which nothing runs, and the Mellon config, of which only what runs (runs())."""
     digest = hashlib.sha256()
     for f in sorted(
         p
         for p in folder.rglob("*")
-        if p.is_file() and p.name != "README.md" and "__pycache__" not in p.parts
+        if p.is_file() and p.suffix != ".md" and "__pycache__" not in p.parts
     ):
-        digest.update(f.relative_to(folder).as_posix().encode() + b"\0" + f.read_bytes())
+        data = rfc8785.dumps(runs(json.loads(f.read_bytes()))) if f.name == CONFIG else f.read_bytes()
+        digest.update(f.relative_to(folder).as_posix().encode() + b"\0" + data)
     return digest.hexdigest()
 
 
