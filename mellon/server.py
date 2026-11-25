@@ -13,6 +13,8 @@ from pathlib import Path
 import traceback
 import time
 from copy import deepcopy
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
@@ -993,39 +995,74 @@ class WebServer:
             raise
         status["state"] = "done"
 
+    class NotRun(Exception):
+        """Ours: a node not run, as a node it links from failed or the run was stopped."""
+
     def _execute_paths(self, sid, paths, nodes, keys, status):
+        """Ours: each node once. A placed node not stored runs on a thread of its own as soon as the nodes it links
+        from are done, at most remote.IN_FLIGHT spawned at once, so a graph's renders are in flight together; every
+        other node runs here, in the paths' order, once the nodes it links from are done. A piece carried on from the
+        one before links from it, so it waits for it. A node that fails, and every node that links from it, directly
+        or not, isn't run; the rest are, and every render is waited for before the first error is raised, so one that
+        fails leaves the others' takes stored and shown."""
         graph_execution_time = time.time()
+        order = list(dict.fromkeys(i for path in paths for i in path))
+        sources = {i: {p['sourceId'] for p in nodes[i]['params'].values() if p.get('sourceId') in order} for i in order}
+        placed = [i for i in order if not status['nodes'].get(i, {}).get('stored') and placement.get(nodes[i]['params'].get('repo_id', {}).get('value'))]
+        done = {i: Future() for i in order if i not in placed}  # each node's: done, or why it isn't
+        finished, progress, in_flight = [0], threading.Lock(), threading.Semaphore(remote.IN_FLIGHT)
 
-        node_count = sum(len(path) for path in paths)
-        task_progress_step = 100 / node_count if node_count > 0 else 100
-        task_progress = 0
-
-        for path in paths:
-            for id in path:
-                if self.interrupt_flag:
-                    self.interrupt_flag = False
-                    self.queue_message({
-                        "type": "graph_stopped",
-                        "sid": sid,
-                        "message": "Execution interrupted by the user."
-                    }, sid)
-                    return
-
-                repo_id = nodes[id]['params'].get('repo_id', {}).get('value')  # ours: each node's seconds, by folder and outcome
-                with telemetry.timed(telemetry.node_s, folder=repo_id or f"{nodes[id]['module']}.{nodes[id]['action']}", outcome="failed") as timing:
+        def execute(id):
+            if broken := [s for s in sources[id] if done[s].exception() is not None]:  # waits for them
+                raise self.NotRun(f"Not run: {', '.join(broken)}, which it links from, did not run")
+            repo_id = nodes[id]['params'].get('repo_id', {}).get('value')  # each node's seconds, by folder and outcome
+            with telemetry.timed(telemetry.node_s, folder=repo_id or f"{nodes[id]['module']}.{nodes[id]['action']}", outcome="failed") as timing:
+                if id in placed:
+                    with in_flight:
+                        if self.interrupt_flag:
+                            raise self.NotRun("Not run: stopped before it was spawned")
+                        status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes)
+                else:
                     status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes)
-                    ran = (status['nodes'][id] or {}).get('ran', True)
-                    timing['outcome'] = ("remote" if placement.get(repo_id) else "ran") if ran else "stored"
+                ran = (status['nodes'][id] or {}).get('ran', True)
+                timing['outcome'] = ("remote" if placement.get(repo_id) else "ran") if ran else "stored"
+            if self.current_task:  # broadcast the task progress
+                with progress:
+                    finished[0] += 1
+                    self.current_task['progress'] = int(100 * finished[0] / len(order))
+                self.queue_message({
+                    "type": "task_progress",
+                    "task_id": self.current_task["task_id"],
+                    "progress": self.current_task['progress'],
+                })
 
-                # broadcast the task progress
-                if self.current_task:
-                    task_progress += task_progress_step
-                    self.current_task['progress'] = int(task_progress)
-                    self.queue_message({
-                        "type": "task_progress",
-                        "task_id": self.current_task["task_id"],
-                        "progress": self.current_task['progress'],
-                    })
+        with ThreadPoolExecutor(max(len(placed), 1), thread_name_prefix="placed") as pool:
+            for i in placed:  # in order, so each node it links from has its future when its thread looks
+                done[i] = pool.submit(execute, i)
+            for id in order:
+                if id in placed:
+                    continue
+                try:
+                    if self.interrupt_flag:
+                        raise self.NotRun("Not run: stopped")
+                    execute(id)
+                    done[id].set_result(None)
+                except Exception as e:
+                    done[id].set_exception(e)
+        failed = {i: done[i].exception() for i in order if done[i].exception() is not None}
+        for i, e in failed.items():
+            logger.error(f"Node {i} ({nodes[i]['module']}.{nodes[i]['action']}): {type(e).__name__}: {e}")
+
+        if self.interrupt_flag:
+            self.interrupt_flag = False
+            self.queue_message({
+                "type": "graph_stopped",
+                "sid": sid,
+                "message": "Execution interrupted by the user."
+            }, sid)
+            return
+        if errors := [e for e in failed.values() if not isinstance(e, self.NotRun)]:
+            raise errors[0]
 
         # the graph has completed
         self.queue_message({

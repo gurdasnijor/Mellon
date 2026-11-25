@@ -13,6 +13,7 @@ from mellon.store import file_here, store
 from mellon.telemetry import remote_s, timed
 
 WAIT = 10  # seconds between looks at whether the server was asked to stop
+IN_FLIGHT = int(os.environ.get("MELLON_REMOTE_CALLS", 4))  # placed nodes run at once by a graph's run
 
 
 def upstream(nodes: dict, node_id: str) -> list[str]:
