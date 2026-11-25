@@ -13,6 +13,7 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
@@ -196,23 +197,25 @@ class Store:
             return self.fs.exists(f"{self.root}/nodes/{key}.json")
 
     def read(self, keys) -> dict:
-        """Each key's stored outputs, or None where nothing is stored, in one pass: a GET per key, all at once (a
-        graph's 18 from a Mac in 0.4 s, where a HEAD and then a read for each took 7.4). A key's outputs never change,
-        its key being what made them, so refs() answers from this pass until the next one; a key not stored then is
-        asked again."""
+        """Each key's stored outputs, or None where nothing is stored, in one pass: a GET per key, all at once. A
+        graph's 18 entries took 0.5 s through s3fs and 0.4 s through a mounted bucket (a folder, as H3's container
+        has), where a check and then a read for each, one after another, took 7.4 and 6.9. A key's outputs never
+        change, its key being what made them, so refs() answers from this pass until the next one; a key not stored
+        then is asked again."""
         keys = list(dict.fromkeys(keys))
         if not (self.fs and keys):
             return dict.fromkeys(keys)
-        paths = {self.fs._strip_protocol(f"{self.root}/nodes/{key}.json"): key for key in keys}
-        with measured("read") as moved:
-            # max_concurrency=1: s3fs asks an object's size (a HEAD) first only to read a large one in parts
-            data = self.fs.cat(list(paths), on_error="return", max_concurrency=1)
-            moved["bytes"] = sum(len(d) for d in data.values() if isinstance(d, bytes))
-        for d in data.values():
-            if isinstance(d, Exception) and not isinstance(d, FileNotFoundError):
-                raise d
-        self.found = {paths[p]: json.loads(d) for p, d in data.items() if isinstance(d, bytes)}
+        with measured("read") as moved, ThreadPoolExecutor(32) as pool:
+            data = dict(zip(keys, pool.map(self._entry, keys)))
+            moved["bytes"] = sum(len(d) for d in data.values() if d is not None)
+        self.found = {key: json.loads(d) for key, d in data.items() if d is not None}
         return {key: self.found.get(key) for key in keys}
+
+    def _entry(self, key: str) -> bytes | None:
+        try:  # max_concurrency=1: s3fs asks an object's size (a HEAD) first only to read a large one in parts
+            return self.fs.cat_file(f"{self.root}/nodes/{key}.json", max_concurrency=1)
+        except FileNotFoundError:
+            return None
 
     def refs(self, key: str) -> dict | None:
         """The stored outputs as written, each file as {"file": ref}: one GET, none if the last read() found them."""
@@ -221,12 +224,9 @@ class Store:
         if not self.fs:
             return None
         with measured("refs") as moved:
-            try:
-                data = self.fs.cat_file(f"{self.root}/nodes/{key}.json", max_concurrency=1)
-            except FileNotFoundError:
-                return None
-            moved["bytes"] = len(data)
-        return json.loads(data)
+            data = self._entry(key)
+            moved["bytes"] = len(data) if data is not None else None
+        return json.loads(data) if data is not None else None
 
     def resolve(self, value):
         """A value with each {"file": ref} in it as a path on this machine, read from the store once."""
