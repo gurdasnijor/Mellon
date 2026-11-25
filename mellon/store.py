@@ -98,10 +98,12 @@ class Store:
         return json.loads(self.fs.cat_file(f"{self.root}/nodes/{key}.json"))
 
     def resolve(self, value):
-        """A value with each {"file": ref} as a path on this machine, read from the store once."""
+        """A value with each {"file": ref} in it as a path on this machine, read from the store once."""
         if isinstance(value, list):
             return [self.resolve(v) for v in value]
-        if not (isinstance(value, dict) and set(value) == {"file"} and self.fs):
+        if isinstance(value, dict) and set(value) != {"file"}:
+            return {k: self.resolve(v) for k, v in value.items()}
+        if not (isinstance(value, dict) and self.fs):
             return value
         if isinstance(self.fs, LocalFileSystem):
             return f"{self.root}/{value['file']}"
@@ -137,9 +139,23 @@ class Store:
                     return (
                         None  # a live object, such as a tensor or a model: the node is not stored
                     )
-                stored[name] = value
+                stored[name] = self._files(value, key, name, iter(range(1 << 30)))
         self.fs.pipe_file(f"{self.root}/nodes/{key}.json", json.dumps(stored).encode())
         return stored
+
+    def _files(self, value, key: str, name: str, index):
+        """A JSON output with each absolute path of a file on this machine in it stored as {"file": ref}, as a key
+        hashes a file a value names: a selection's clip is read back wherever the selection is."""
+        if isinstance(value, list):
+            return [self._files(v, key, name, index) for v in value]
+        if isinstance(value, dict):
+            return {k: self._files(v, key, name, index) for k, v in value.items()}
+        if not (isinstance(value, str) and os.path.isabs(value) and os.path.isfile(value)):
+            return value
+        ref = f"nodes/{key}/{name}/{next(index)}{Path(value).suffix}"
+        self.fs.makedirs(f"{self.root}/nodes/{key}/{name}", exist_ok=True)
+        self.fs.put_file(value, f"{self.root}/{ref}")
+        return {"file": ref}
 
 
 def revision(folder: Path) -> str:
