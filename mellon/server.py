@@ -104,6 +104,7 @@ class WebServer:
             web.get('/preview', self.preview),
             web.post('/graph', self.graph),
             web.get('/graph/{task_id}', self.graph_status),
+            web.post('/stored', self.stored),  # ours
             web.get('/queue', self.get_queue),
             web.delete('/queue/{task_id}', self.delete_task),
             web.get('/stop', self.stop_execution),
@@ -974,6 +975,20 @@ class WebServer:
             "task_id": task_id,
         })
     
+    def check(self, nodes):
+        """ours: every node's key, whether or not this server runs it (a file by its content), and whether it is stored,
+        from every node's stored outputs read in one pass, which refs() then answers from"""
+        with telemetry.timed(telemetry.store_s, op="keys"):
+            keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'], types)
+        found = store.read(keys.values())
+        return keys, {i: found[k] is not None for i, k in keys.items()}
+
+    async def stored(self, request):
+        """ours: POST an exported graph ({nodes}); answers {id: stored} by the check a run starts with, running nothing,
+        so the canvas shows what the store holds when a graph opens or an edit moves a key"""
+        nodes = (await request.json())['nodes']
+        return web.json_response((await asyncio.to_thread(self.check, nodes))[1])
+
     def execute_graph(self, graph):
         with telemetry.timed(telemetry.graph_s, outcome="failed") as run:  # ours: the run's seconds
             self._execute_graph(graph)
@@ -984,10 +999,8 @@ class WebServer:
         nodes = graph['nodes']
         paths = graph['paths']
         with telemetry.timed(telemetry.store_s, op="check"):  # ours: the run's check, its keys and whether each is stored
-            with telemetry.timed(telemetry.store_s, op="keys"):
-                keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'], types)  # ours: every node's, whether or not this server runs it; a file by its content
-            found = store.read(keys.values())  # ours: every node's stored outputs in one pass, which refs() then answers from
-            status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": found[k] is not None} for i, k in keys.items()}}
+            keys, stored = self.check(nodes)
+            status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": stored[i]} for i, k in keys.items()}}
         # ours: a post that runs a node placed elsewhere (a render) is kept as a saved graph, the canvas as it was run,
         # beside the composition it was opened from, at its first spawn (a skipped render keeps nothing); its keys find its takes
         self.keep_render = (lambda: store.save_graph(render_path(graph.get('saved'), time.time()), json.dumps({**graph['canvas'], 'keys': keys}).encode(), None)) if graph.get('canvas') and store.fs else None  # and its keys, which find its videos (/renders)
