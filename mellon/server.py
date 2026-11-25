@@ -1141,6 +1141,7 @@ class WebServer:
                 raise RuntimeError(f"{place} ran node {id} but stored no outputs")
         if refs is not None:
             node.output = refs  # read from the store only where it is used: by a node that runs here, or /cache
+            node.params = {}  # its outputs are another key's: NodeBase's memo, by node id, must not answer a later run with them
             self.queue_message({"type": "executed", "node": id, "name": f"{module}.{action}", "stored": True}, sid)
         else:
             args = {p: store.resolve(v) for p, v in args.items()}  # ours: each {"file": ref} as a path on this machine
