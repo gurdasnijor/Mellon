@@ -13,11 +13,13 @@ import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 import fsspec
 import rfc8785
 from fsspec.implementations.local import LocalFileSystem
+from opentelemetry import metrics
 
 RUNNER = {
     "device",
@@ -29,6 +31,33 @@ RUNNER = {
 MELLON = "mellon@5fd24292"  # the revision of a node that is not a folder: Mellon's own, at our fork's base
 FILES = ("video", "image", "file")
 SHA256 = re.compile(r"sha256:([0-9a-f]{64})")  # a file named by its content, as a library entry names it
+
+
+# Seconds, from a store request's milliseconds to a render's minutes; bytes, from a key's JSON to a take (telemetry.py)
+SECONDS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 7.5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600]
+BYTES = [1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9]
+_meter = metrics.get_meter("mellon")
+store_s = _meter.create_histogram(
+    "mellon.store.duration", unit="s", description="One operation on the store. By op.",
+    explicit_bucket_boundaries_advisory=SECONDS,
+)
+store_bytes = _meter.create_histogram(
+    "mellon.store.size", unit="By", description="What one operation on the store read or wrote. By op.",
+    explicit_bucket_boundaries_advisory=BYTES,
+)
+
+
+@contextmanager
+def measured(op: str):
+    """The block's seconds in mellon.store.duration, and the bytes it sets in mellon.store.size."""
+    moved = {"bytes": None}
+    start = time.perf_counter()
+    try:
+        yield moved
+    finally:
+        store_s.record(time.perf_counter() - start, {"op": op})
+        if moved["bytes"] is not None:
+            store_bytes.record(moved["bytes"], {"op": op})
 
 
 _hashes: dict = {}  # a file's SHA-256 by (path, size, mtime), so an unchanged file is read once per process
@@ -160,13 +189,19 @@ class Store:
         self.local = Path(local)  # where this machine keeps the remote files it has read
 
     def exists(self, key: str) -> bool:
-        return bool(self.fs) and self.fs.exists(f"{self.root}/nodes/{key}.json")
+        if not self.fs:
+            return False
+        with measured("exists"):
+            return self.fs.exists(f"{self.root}/nodes/{key}.json")
 
     def refs(self, key: str) -> dict | None:
         """The stored outputs as written, each file as {"file": ref}."""
         if not (self.fs and self.exists(key)):
             return None
-        return json.loads(self.fs.cat_file(f"{self.root}/nodes/{key}.json"))
+        with measured("refs") as moved:
+            data = self.fs.cat_file(f"{self.root}/nodes/{key}.json")
+            moved["bytes"] = len(data)
+        return json.loads(data)
 
     def resolve(self, value):
         """A value with each {"file": ref} in it as a path on this machine, read from the store once."""
@@ -186,7 +221,9 @@ class Store:
             fd, part = tempfile.mkstemp(dir=local.parent, prefix=f".{local.name}.", suffix=".part")
             os.close(fd)
             try:
-                self.fs.get_file(f"{self.root}/{value['file']}", part)
+                with measured("resolve") as moved:
+                    self.fs.get_file(f"{self.root}/{value['file']}", part)
+                    moved["bytes"] = os.path.getsize(part)
                 os.replace(part, local)
             finally:
                 if os.path.exists(part):
@@ -261,6 +298,10 @@ class Store:
     def put(self, key: str, outputs: dict, declared: dict, entry: dict | None = None) -> dict | None:
         """Files first, the marker last, then the node's library entry if it has one. None, and nothing stored, if an
         output is neither JSON nor a file on disk."""
+        with measured("put") as moved:
+            return self._put(key, outputs, declared, entry, moved)
+
+    def _put(self, key: str, outputs: dict, declared: dict, entry: dict | None, moved: dict) -> dict | None:
         if not self.fs:
             return None
         stored = {}
@@ -276,6 +317,7 @@ class Store:
                     ref = f"nodes/{key}/{name}/{index}{Path(path).suffix}"
                     self.fs.makedirs(f"{self.root}/nodes/{key}/{name}", exist_ok=True)
                     self.fs.put_file(path, f"{self.root}/{ref}")
+                    moved["bytes"] = (moved["bytes"] or 0) + os.path.getsize(path)
                     refs.append({"file": ref})
                 stored[name] = refs if isinstance(value, list) else refs[0]
             else:

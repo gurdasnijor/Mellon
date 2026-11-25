@@ -18,10 +18,18 @@ logger = logging.getLogger('mellon')
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
 from mellon.store import store, revisions, types, graph_keys, placement, graph_path, Stale, library_entry, render_path
-from mellon import remote
+from mellon import remote, telemetry
 from modules import MODULE_MAP
+telemetry.configure()  # ours: before the app is made, so aiohttp's instrumentation sees it
 from utils.huggingface import get_local_models, delete_model, search_hub, download_hub_model, get_local_model_ids
 from utils.torch_utils import reset_memory_stats, get_memory_stats
+
+async def revalidated(request, response):
+    """Ours: the client's files are asked for again on each load, a 304 when unchanged, as index.html already is: their
+    names have no hash, so a browser that kept them would run an old client after a deploy."""
+    if request.path.startswith(('/assets/', '/user/')):
+        response.headers['Cache-Control'] = 'no-cache'
+
 
 class WebServer:
     def __init__(
@@ -72,6 +80,7 @@ class WebServer:
         self.work_dir = work_dir
         self.data_dir = data_dir
         self.app = web.Application(client_max_size=self.client_max_size)
+        self.app.on_response_prepare.append(revalidated)  # ours
 
         # set up the routes
         self.app.add_routes([
@@ -959,11 +968,18 @@ class WebServer:
         })
     
     def execute_graph(self, graph):
+        with telemetry.timed(telemetry.graph_s, outcome="failed") as run:  # ours: the run's seconds
+            self._execute_graph(graph)
+            run["outcome"] = "done"
+
+    def _execute_graph(self, graph):
         sid = graph['sid']
         nodes = graph['nodes']
         paths = graph['paths']
-        keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'], types)  # ours: every node's, whether or not this server runs it; a file by its content
-        status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": store.exists(k)} for i, k in keys.items()}}
+        with telemetry.timed(telemetry.store_s, op="check"):  # ours: the run's check, its keys and whether each is stored
+            with telemetry.timed(telemetry.store_s, op="keys"):
+                keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'], types)  # ours: every node's, whether or not this server runs it; a file by its content
+            status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": store.exists(k)} for i, k in keys.items()}}
         # ours: a post that runs a node placed elsewhere (a render) is kept as a saved graph, the canvas as it was run,
         # beside the composition it was opened from; its keys find its takes
         placed = [i for path in paths for i in path if placement.get(nodes[i]['params'].get('repo_id', {}).get('value'))]
@@ -994,7 +1010,11 @@ class WebServer:
                     }, sid)
                     return
 
-                status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes)
+                repo_id = nodes[id]['params'].get('repo_id', {}).get('value')  # ours: each node's seconds, by folder and outcome
+                with telemetry.timed(telemetry.node_s, folder=repo_id or f"{nodes[id]['module']}.{nodes[id]['action']}", outcome="failed") as timing:
+                    status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes)
+                    ran = (status['nodes'][id] or {}).get('ran', True)
+                    timing['outcome'] = ("remote" if placement.get(repo_id) else "ran") if ran else "stored"
 
                 # broadcast the task progress
                 if self.current_task:
