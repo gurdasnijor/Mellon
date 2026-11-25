@@ -13,6 +13,8 @@ from pathlib import Path
 import traceback
 import time
 from copy import deepcopy
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
@@ -996,46 +998,83 @@ class WebServer:
             raise
         status["state"] = "done"
 
+    class NotRun(Exception):
+        """Ours: a node not run, as a node it links from failed or the run was stopped."""
+
+    keeping = threading.Lock()  # ours: keep_render's, taken at a spawn, which a render's own thread makes
+
     def _execute_paths(self, sid, paths, nodes, keys, status):
+        """Ours: each node once. A placed node not stored runs on a thread of its own as soon as the nodes it links
+        from are done, at most remote.IN_FLIGHT spawned at once, so a graph's renders are in flight together; every
+        other node runs here, in the paths' order, once the nodes it links from are done. A piece carried on from the
+        one before links from it, so it waits for it. What the nodes it links from did decides, in one walk, what a
+        node does: if one failed, it isn't run, and nor is any node after it; if a non-spawn input links a skipped
+        one, it is skipped too (not run, spawned or stored); a spawn input leaves skipped ones out. Every render is
+        waited for before the first error is raised, so one that fails leaves the others' takes stored and shown."""
         graph_execution_time = time.time()
+        order = list(dict.fromkeys(i for path in paths for i in path))
+        links = {i: [(p['sourceId'], bool(p.get('spawn'))) for p in nodes[i]['params'].values() if p.get('sourceId') in order] for i in order}
+        placed = [i for i in order if not status['nodes'].get(i, {}).get('stored') and placement.get(nodes[i]['params'].get('repo_id', {}).get('value'))]
+        done = {i: Future() for i in order if i not in placed}  # each node's status once done, or why it isn't
+        finished, progress, in_flight = [0], threading.Lock(), threading.Semaphore(remote.IN_FLIGHT)
 
-        node_count = sum(len(path) for path in paths)
-        task_progress_step = 100 / node_count if node_count > 0 else 100
-        task_progress = 0
-        skipped = set()  # ours: nodes with nothing to do, and every node that links one (a spawn input leaves it out)
-
-        for path in paths:
-            for id in path:
-                if self.interrupt_flag:
-                    self.interrupt_flag = False
-                    self.queue_message({
-                        "type": "graph_stopped",
-                        "sid": sid,
-                        "message": "Execution interrupted by the user."
-                    }, sid)
-                    return
-
-                repo_id = nodes[id]['params'].get('repo_id', {}).get('value')  # ours: each node's seconds, by folder and outcome
-                if any(p.get('sourceId') in skipped and not p.get('spawn') for p in nodes[id]['params'].values()):
-                    status['nodes'][id] = {"key": keys[id], "stored": False, "skipped": True}  # ours: not run, spawned or stored
-                else:
-                    with telemetry.timed(telemetry.node_s, folder=repo_id or f"{nodes[id]['module']}.{nodes[id]['action']}", outcome="failed") as timing:
+        def execute(id):
+            if failed := list(dict.fromkeys(s for s, _ in links[id] if done[s].exception() is not None)):  # waits for them
+                raise self.NotRun(f"Not run: {', '.join(failed)}, which it links from, did not run")
+            skipped = {s for s, _ in links[id] if (done[s].result() or {}).get('skipped')}
+            repo_id = nodes[id]['params'].get('repo_id', {}).get('value')  # each node's seconds, by folder and outcome
+            if any(s in skipped and not spawn for s, spawn in links[id]):
+                status['nodes'][id] = {"key": keys[id], "stored": False, "skipped": True}  # not run, spawned or stored
+            else:
+                with telemetry.timed(telemetry.node_s, folder=repo_id or f"{nodes[id]['module']}.{nodes[id]['action']}", outcome="failed") as timing:
+                    if id in placed:
+                        with in_flight:
+                            if self.interrupt_flag:
+                                raise self.NotRun("Not run: stopped before it was spawned")
+                            status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes, skipped=skipped)
+                    else:
                         status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes, skipped=skipped)
-                        ran = (status['nodes'][id] or {}).get('ran', True)
-                        timing['outcome'] = "skipped" if (status['nodes'][id] or {}).get('skipped') else ("remote" if placement.get(repo_id) else "ran") if ran else "stored"
-                if (status['nodes'][id] or {}).get('skipped'):
-                    skipped.add(id)
-                    self.queue_message({"type": "skipped", "node": id}, sid)
+                    ran = (status['nodes'][id] or {}).get('ran', True)
+                    timing['outcome'] = "skipped" if (status['nodes'][id] or {}).get('skipped') else ("remote" if placement.get(repo_id) else "ran") if ran else "stored"
+            if (status['nodes'][id] or {}).get('skipped'):
+                self.queue_message({"type": "skipped", "node": id}, sid)
+            if self.current_task:  # broadcast the task progress
+                with progress:
+                    finished[0] += 1
+                    self.current_task['progress'] = int(100 * finished[0] / len(order))
+                self.queue_message({
+                    "type": "task_progress",
+                    "task_id": self.current_task["task_id"],
+                    "progress": self.current_task['progress'],
+                })
+            return status['nodes'][id]
 
-                # broadcast the task progress
-                if self.current_task:
-                    task_progress += task_progress_step
-                    self.current_task['progress'] = int(task_progress)
-                    self.queue_message({
-                        "type": "task_progress",
-                        "task_id": self.current_task["task_id"],
-                        "progress": self.current_task['progress'],
-                    })
+        with ThreadPoolExecutor(max(len(placed), 1), thread_name_prefix="placed") as pool:
+            for i in placed:  # in order, so each node it links from has its future when its thread looks
+                done[i] = pool.submit(execute, i)
+            for id in order:
+                if id in placed:
+                    continue
+                try:
+                    if self.interrupt_flag:
+                        raise self.NotRun("Not run: stopped")
+                    done[id].set_result(execute(id))
+                except Exception as e:
+                    done[id].set_exception(e)
+        failed = {i: done[i].exception() for i in order if done[i].exception() is not None}
+        for i, e in failed.items():
+            logger.error(f"Node {i} ({nodes[i]['module']}.{nodes[i]['action']}): {type(e).__name__}: {e}")
+
+        if self.interrupt_flag:
+            self.interrupt_flag = False
+            self.queue_message({
+                "type": "graph_stopped",
+                "sid": sid,
+                "message": "Execution interrupted by the user."
+            }, sid)
+            return
+        if errors := [e for e in failed.values() if not isinstance(e, self.NotRun)]:
+            raise errors[0]
 
         # the graph has completed
         self.queue_message({
@@ -1055,8 +1094,8 @@ class WebServer:
         self.interrupt_flag = True
 
         # set the interrupt flag for all the nodes in the cache
-        for node in self.node_cache:
-            self.node_cache[node]._interrupt = True
+        for node in list(self.node_cache.values()):  # ours: a copy, as a placed node's thread may add one meanwhile
+            node._interrupt = True
         
         return web.json_response({"error": False, "message": "Execution set for interruption."})
 
@@ -1132,9 +1171,10 @@ class WebServer:
         refs = store.refs(key) if key else None
         place = placement.get(params.get('repo_id', {}).get('value')) if key and nodes and refs is None else None
         if place:  # ours: a node placed elsewhere (nodes.json) runs there, and its outputs are read from the store
-            if getattr(self, 'keep_render', None):
-                self.keep_render()
-                self.keep_render = None
+            with self.keeping:  # renders spawn from threads of their own: the first to spawn keeps the render, once
+                keep, self.keep_render = getattr(self, 'keep_render', None), None
+            if keep:
+                keep()
             remote.run(place, id, nodes, keys, revisions[params['repo_id']['value']], CONFIG.paths['work_dir'], lambda: self.interrupt_flag)
             refs = store.refs(key)
             if refs is None:
@@ -1340,7 +1380,7 @@ class WebServer:
         logger.debug(f"Websocket connection opened: {sid}")
 
         # Update the session id in all cached nodes
-        for node in self.node_cache:
+        for node in list(self.node_cache):  # ours: a copy, as a placed node's thread may add one meanwhile
             # check if the node has a _sid attribute
             if hasattr(self.node_cache[node], '_sid') and self.node_cache[node]._sid != sid:
                 self.node_cache[node]._sid = sid
