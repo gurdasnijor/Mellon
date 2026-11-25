@@ -17,7 +17,7 @@ logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
-from mellon.store import store, revisions, types, graph_keys, placement, graph_path, Stale, library_entry
+from mellon.store import store, revisions, types, graph_keys, placement, graph_path, Stale, library_entry, render_path
 from mellon import remote
 from modules import MODULE_MAP
 from utils.huggingface import get_local_models, delete_model, search_hub, download_hub_model, get_local_model_ids
@@ -964,6 +964,11 @@ class WebServer:
         paths = graph['paths']
         keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'], types)  # ours: every node's, whether or not this server runs it; a file by its content
         status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": store.exists(k)} for i, k in keys.items()}}
+        # ours: a post that runs a node placed elsewhere (a render) is kept as a saved graph, the canvas as it was run,
+        # beside the composition it was opened from; its keys find its takes
+        placed = [i for path in paths for i in path if placement.get(nodes[i]['params'].get('repo_id', {}).get('value'))]
+        if graph.get('canvas') and store.fs and any(not status['nodes'][i]['stored'] for i in placed):
+            store.save_graph(render_path(graph.get('saved'), time.time()), json.dumps(graph['canvas']).encode(), None)
         try:
             self._execute_paths(sid, paths, nodes, keys, status)
         except Exception as e:

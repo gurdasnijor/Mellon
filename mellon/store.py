@@ -12,6 +12,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 
 import fsspec
@@ -94,9 +95,10 @@ def graph_keys(nodes: dict, revisions: dict, work_dir: str | Path = ".", types: 
                     if p.get("sourceId")
                     else {"value": content(typed(p.get("value"), declared.get(name)), Path(work_dir))}
                 )
-            body = {
-                "module": node["module"],
-                "action": node["action"],
+            ours = repo_id in revisions  # a node of one of our folders keys as the Dynamic Block Node that runs it,
+            body = {  # whichever sidebar entry made it (custom.H3's, or Dynamic Block Node's with the folder loaded)
+                "module": "modules.ModularDiffusers" if ours else node["module"],
+                "action": "DynamicBlockNode" if ours else node["action"],
                 "revision": revisions.get(repo_id, MELLON),
                 "params": params,
             }
@@ -140,6 +142,16 @@ def graph_path(path: str) -> str | None:
     if len(parts) < 2 or not path.endswith(".json") or any(p in ("", ".", "..") or p.startswith("/") for p in parts):
         return None
     return f"graphs/{path}"
+
+
+def render_path(saved: str | None, when: float) -> str:
+    """Where a render posted from the canvas is kept as a saved graph: graphs/<workspace>/<name>/renders/<UTC time>.json
+    for the saved graph <workspace>/<name>.json it was opened from (store:graphs/..., as the canvas has it; a render
+    opened and run again files under its composition), graphs/renders/<UTC time>.json for a graph never saved."""
+    stamp = time.strftime("%Y-%m-%dT%H-%M-%S", time.gmtime(when)) + f".{int(when % 1 * 1000):03d}Z"
+    name = saved.removeprefix("store:graphs/").removesuffix(".json") if saved and saved.startswith("store:graphs/") else ""
+    name = name.split("/renders/")[0]
+    return f"graphs/{name}/renders/{stamp}.json" if name else f"graphs/renders/{stamp}.json"
 
 
 class Store:
