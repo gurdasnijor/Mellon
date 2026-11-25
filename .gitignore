@@ -21,6 +21,7 @@ data/graphs/*
 
 web/user/*
 !web/user/ExampleField.js
+!web/user/ClipRange.js
 
 .venv
 venv
