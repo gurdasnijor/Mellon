@@ -168,8 +168,17 @@ class Store:
             return f"{self.root}/{value['file']}"
         local = self.local / value["file"]
         if not local.exists():
+            # Read to a name of its own, then renamed into place: a file at this path is a whole one, so a second
+            # reader (the canvas's preview of the node beside the node using it) never reads one half written
             local.parent.mkdir(parents=True, exist_ok=True)
-            self.fs.get_file(f"{self.root}/{value['file']}", str(local))
+            fd, part = tempfile.mkstemp(dir=local.parent, prefix=f".{local.name}.", suffix=".part")
+            os.close(fd)
+            try:
+                self.fs.get_file(f"{self.root}/{value['file']}", part)
+                os.replace(part, local)
+            finally:
+                if os.path.exists(part):
+                    os.remove(part)
         return str(local)
 
     def graphs(self) -> list[str]:
