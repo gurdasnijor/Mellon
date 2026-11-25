@@ -17,7 +17,7 @@ logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
-from mellon.store import store, revisions, graph_keys, placement
+from mellon.store import store, revisions, graph_keys, placement, graph_path, Stale
 from mellon import remote
 from modules import MODULE_MAP
 from utils.huggingface import get_local_models, delete_model, search_hub, download_hub_model, get_local_model_ids
@@ -86,6 +86,7 @@ class WebServer:
             web.delete('/cache', self.delete_cache),
             web.get('/listdir', self.listdir),
             web.get('/listgraphs', self.listgraphs),
+            web.put('/graphs/{path:.+}', self.save_graph),
             web.get('/file', self.fileGet),
             web.post('/file', self.filePost),
             web.get('/preview', self.preview),
@@ -703,10 +704,12 @@ class WebServer:
 
     async def listgraphs(self, request):
         path = Path(self.data_dir) / 'graphs'
-        if not path.exists():
+        saved = store.graphs()  # ours: the store's saved graphs, listed as the folder "saved"
+        if not path.exists() and not saved:
             return web.json_response({"error": True, "message": "No graph directory found."}, status=404)
         
-        graphs = list_files(str(path), recursive=True, extensions=['json'])
+        graphs = list_files(str(path), recursive=True, extensions=['json']) if path.exists() else []
+        graphs += [{"rel_directory": str(Path("saved") / Path(g).parent), "name": Path(g).name, "path": f"store:graphs/{g}"} for g in saved]
 
         # build a nested tree of directories and files
         tree: list[dict] = []
@@ -760,6 +763,13 @@ class WebServer:
 
         if not file:
             return web.json_response({"error": "Incorrect request, `file` is required."}, status=400)
+
+        if file.startswith('store:'):  # ours: a saved graph in the store, with its ETag for a save to send back
+            ref = file.removeprefix('store:')
+            found = store.graph(ref) if ref.startswith('graphs/') else None
+            if not found:
+                return web.json_response({"error": f"The file {file} does not exist."}, status=404)
+            return web.Response(body=found[0], content_type='application/json', headers={'ETag': found[1], 'Cache-Control': 'no-cache'})
         
         file_path = Path(file)
         if not file_path.is_absolute():
@@ -769,6 +779,26 @@ class WebServer:
             return web.json_response({"error": f"The file {file} does not exist."}, status=404)
         
         return web.FileResponse(file_path)
+
+    async def save_graph(self, request):
+        """ours: PUT /graphs/<workspace>/<name>.json saves the canvas's graph to the store. With If-Match, only over the
+        graph as it was opened; without, only where none is: anything else is 412, as a save from a stale tab."""
+        ref = graph_path(request.match_info['path'])
+        if not ref:
+            return web.json_response({"error": "A saved graph's path is <workspace>/<name>.json."}, status=400)
+        if not store.fs:
+            return web.json_response({"error": "No store to save to: set MELLON_STORE."}, status=404)
+        data = await request.read()
+        try:
+            graph = json.loads(data)
+            assert isinstance(graph, dict) and 'nodes' in graph and 'edges' in graph
+        except (ValueError, AssertionError):
+            return web.json_response({"error": "Not a graph: the canvas's nodes, edges and viewport."}, status=400)
+        try:
+            etag = store.save_graph(ref, data, request.headers.get('If-Match'))
+        except Stale:
+            return web.json_response({"error": f"{request.match_info['path']} has changed since it was opened, or already exists."}, status=412)
+        return web.json_response({"path": f"store:{ref}", "etag": etag}, headers={'ETag': etag})
 
     async def filePost(self, request):
         data = await request.post()

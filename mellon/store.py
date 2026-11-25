@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import fsspec
 import rfc8785
@@ -91,6 +91,18 @@ def graph_keys(nodes: dict, revisions: dict, work_dir: str | Path = ".") -> dict
     return keys
 
 
+class Stale(Exception):
+    """A saved graph changed since it was opened, or one of that name exists: the save is refused."""
+
+
+def graph_path(path: str) -> str | None:
+    """graphs/<path> for a saved graph's path, <workspace>/<name>.json, or None if it isn't one."""
+    parts = PurePosixPath(path).parts
+    if len(parts) < 2 or not path.endswith(".json") or any(p in ("", ".", "..") or p.startswith("/") for p in parts):
+        return None
+    return f"graphs/{path}"
+
+
 class Store:
     def __init__(self, url: str | None, local: str | Path):
         self.fs, self.root = fsspec.core.url_to_fs(url) if url else (None, None)
@@ -120,6 +132,49 @@ class Store:
             local.parent.mkdir(parents=True, exist_ok=True)
             self.fs.get_file(f"{self.root}/{value['file']}", str(local))
         return str(local)
+
+    def graphs(self) -> list[str]:
+        """Every saved graph's path under graphs/, such as dev/a composition.json."""
+        if not self.fs or not self.fs.exists(f"{self.root}/graphs"):
+            return []
+        base = f"{self.root}/graphs/"
+        return sorted(f[len(base) :] for f in self.fs.find(base) if f.endswith(".json"))
+
+    def _etag(self, path: str, data: bytes | None = None) -> str:
+        """The object's ETag; a folder's is the MD5 its bytes would have as one S3 put, which is R2's."""
+        if isinstance(self.fs, LocalFileSystem):
+            return '"' + hashlib.md5(self.fs.cat_file(path) if data is None else data).hexdigest() + '"'
+        return self.fs.info(path)["ETag"]
+
+    def graph(self, ref: str) -> tuple[bytes, str] | None:
+        """A saved graph's bytes and ETag, ref being graphs/<path>."""
+        path = f"{self.root}/{ref}"
+        if not (self.fs and self.fs.exists(path)):
+            return None
+        data = self.fs.cat_file(path)
+        return data, self._etag(path, data)
+
+    def save_graph(self, ref: str, data: bytes, etag: str | None) -> str:
+        """Writes graphs/<path> if it is still as opened (etag), or doesn't exist yet (no etag), and returns its new
+        ETag; raises Stale otherwise. R2 checks the condition itself (If-Match, If-None-Match)."""
+        path = f"{self.root}/{ref}"
+        if isinstance(self.fs, LocalFileSystem):  # one server per folder: check, then write
+            exists = self.fs.exists(path)
+            if (self._etag(path) if exists else None) != etag:
+                raise Stale(ref)
+            self.fs.makedirs(path.rsplit("/", 1)[0], exist_ok=True)
+            self.fs.pipe_file(path, data)
+            return self._etag(path, data)
+        from botocore.exceptions import ClientError
+
+        condition = {"IfMatch": etag} if etag else {"IfNoneMatch": "*"}
+        try:
+            return self.fs.pipe_file(path, data, **condition)["ETag"]
+        except OSError as e:
+            cause = e.__cause__
+            if isinstance(cause, ClientError) and cause.response["Error"]["Code"] in ("PreconditionFailed", "412"):
+                raise Stale(ref) from e
+            raise
 
     def put(self, key: str, outputs: dict, declared: dict) -> dict | None:
         """Files first, the marker last. None, and nothing stored, if an output is neither JSON nor a file on disk."""
