@@ -17,6 +17,7 @@ logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
+from mellon.store import store, revisions, graph_keys
 from modules import MODULE_MAP
 from utils.huggingface import get_local_models, delete_model, search_hub, download_hub_model, get_local_model_ids
 from utils.torch_utils import reset_memory_stats, get_memory_stats
@@ -44,6 +45,7 @@ class WebServer:
 
         self.interrupt_flag = False
         self.node_cache = {}
+        self.tasks = {}  # ours: each graph's state for GET /graph/{task_id}, kept while the server runs (unbounded)
 
         self.queued_tasks = {}
         self.current_task = {}
@@ -87,6 +89,7 @@ class WebServer:
             web.post('/file', self.filePost),
             web.get('/preview', self.preview),
             web.post('/graph', self.graph),
+            web.get('/graph/{task_id}', self.graph_status),
             web.get('/queue', self.get_queue),
             web.delete('/queue/{task_id}', self.delete_task),
             web.get('/stop', self.stop_execution),
@@ -241,7 +244,16 @@ class WebServer:
             "queued": task_list,
             "current": current_task,
         })
-        
+        return task_id  # ours: POST /graph answered task_id null without it
+
+    async def graph_status(self, request):
+        """Ours: {state: running | done | failed, error, nodes: {id: {key, stored, ran?, outputs?}}}, every node of the graph."""
+        task_id = request.match_info["task_id"]
+        if task_id in self.queued_tasks or (task_id not in self.tasks and (self.current_task or {}).get("task_id") == task_id):
+            return web.json_response({"state": "queued"})
+        task = self.tasks.get(task_id)
+        return web.json_response(task) if task else web.json_response({"error": True, "message": "No such graph."}, status=404)
+
     async def get_queue(self, _):
         """
         HTTP endpoint to return the tasks queue and the current task.
@@ -895,7 +907,16 @@ class WebServer:
         sid = graph['sid']
         nodes = graph['nodes']
         paths = graph['paths']
+        keys = graph_keys(nodes, revisions)  # ours: every node's, whether or not this server runs it
+        status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": store.exists(k)} for i, k in keys.items()}}
+        try:
+            self._execute_paths(sid, paths, nodes, keys, status)
+        except Exception as e:
+            status.update(state="failed", error=f"{type(e).__name__}: {e}")
+            raise
+        status["state"] = "done"
 
+    def _execute_paths(self, sid, paths, nodes, keys, status):
         graph_execution_time = time.time()
 
         node_count = sum(len(path) for path in paths)
@@ -913,7 +934,7 @@ class WebServer:
                     }, sid)
                     return
 
-                self.execute_node(id, nodes[id], sid)
+                status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys)
 
                 # broadcast the task progress
                 if self.current_task:
@@ -948,7 +969,7 @@ class WebServer:
         
         return web.json_response({"error": False, "message": "Execution set for interruption."})
 
-    def execute_node(self, id, node, sid, quiet=False):
+    def execute_node(self, id, node, sid, quiet=False, keys=None):
         module = node['module']
         action = node['action']
         params = node['params']
@@ -1009,6 +1030,15 @@ class WebServer:
 
         # set the session id, it can be used to send messages from the node back to the client
         self.node_cache[id]._sid = sid
+
+        # ours: a node stored under its key is not run, here or on any machine sharing the store
+        key = keys[id] if keys else None
+        refs = store.refs(key) if key else None
+        if refs is not None:
+            self.node_cache[id].output = refs  # read from the store only by a node that runs here
+            self.queue_message({"type": "executed", "node": id, "name": f"{module}.{action}", "stored": True}, sid)
+            return {"key": key, "stored": True, "ran": False, "outputs": refs}
+        args = {p: store.resolve(v) for p, v in args.items()}  # ours: each {"file": ref} as a path on this machine
 
         # *** execute the node ***
         try:
@@ -1084,6 +1114,16 @@ class WebServer:
 
             if message:
                 self.queue_message(message, sid)
+
+        # ours: store the outputs under the node's key; a Dynamic Block node declares its outputs in its folder's config
+        if not key:
+            return None
+        if hasattr(self.node_cache[id], '_get_custom_config'):
+            declared = self.node_cache[id]._get_custom_config(args['repo_id']).node_params['custom']['params']
+        else:
+            declared = self.modules[module][action]['params']
+        stored = store.put(key, self.node_cache[id].output, declared)
+        return {"key": key, "stored": stored is not None, "ran": True, "outputs": stored}
 
 
     def trigger_node(self, source_id, output, sid):

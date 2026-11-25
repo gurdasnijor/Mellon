@@ -1,6 +1,8 @@
 aiohttp
 aiohttp_cors
 nanoid
+fsspec
+rfc8785
 git+https://github.com/huggingface/diffusers
 transformers
 accelerate
