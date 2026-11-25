@@ -569,11 +569,12 @@ class WebServer:
         if isinstance(data, list):
             index = max(0, min(len(data) - 1, int(index))) if index else 0
             data = data[index]
+        data = store.resolve(data)  # ours: a stored output, read from the store when it is opened
 
         # check the registry for the type of the field
         module = self.node_cache[node].module_name
         action = self.node_cache[node].class_name
-        type = self.modules[module][action]['params'][field].get('type')
+        type = getattr(self.node_cache[node], '_fields', self.modules[module][action]['params'])[field].get('type')  # ours
 
         filename = request.query.get('filename', f"{field}")
 
@@ -1031,24 +1032,29 @@ class WebServer:
         # set the session id, it can be used to send messages from the node back to the client
         self.node_cache[id]._sid = sid
 
-        # ours: a node stored under its key is not run, here or on any machine sharing the store
+        # ours: a Dynamic Block node's fields are its class's and its folder's config's (previews, /cache, the store)
+        node = self.node_cache[id]
+        fields = node._fields = {**self.modules[module][action]['params'], **(node._get_custom_config(args['repo_id']).node_params['custom']['params'] if hasattr(node, '_get_custom_config') else {})}
+
+        # ours: a node stored under its key is not run, here or on any machine sharing the store, but shows its previews
         key = keys[id] if keys else None
         refs = store.refs(key) if key else None
         if refs is not None:
-            self.node_cache[id].output = refs  # read from the store only by a node that runs here
+            node.output = refs  # read from the store only where it is used: by a node that runs here, or /cache
             self.queue_message({"type": "executed", "node": id, "name": f"{module}.{action}", "stored": True}, sid)
-            return {"key": key, "stored": True, "ran": False, "outputs": refs}
-        args = {p: store.resolve(v) for p, v in args.items()}  # ours: each {"file": ref} as a path on this machine
+        else:
+            args = {p: store.resolve(v) for p, v in args.items()}  # ours: each {"file": ref} as a path on this machine
 
         # *** execute the node ***
         try:
-            self.node_cache[id](**args)
+            if refs is None:  # ours
+                self.node_cache[id](**args)
         except Exception as e:
             logger.error(f"Error executing node {id} ({module}.{action})")
             logger.error(traceback.format_exc())
             raise e
 
-        if not quiet:
+        if not quiet and refs is None:  # ours
             execution_time = time.time() - start_time
             self.node_cache[id]._execution_time['last'] = execution_time
             self.node_cache[id]._execution_time['min'] = min(self.node_cache[id]._execution_time['min'], execution_time) if self.node_cache[id]._execution_time['min'] is not None else execution_time
@@ -1074,7 +1080,7 @@ class WebServer:
             message = None
 
             # skip for button and group fields
-            if self.modules[module][action]['params'][ui_key].get('display') in ['ui_button', 'ui_group']:
+            if fields[ui_key].get('display') in ['ui_button', 'ui_group']:
                 continue
 
             else:
@@ -1086,11 +1092,12 @@ class WebServer:
                 else:
                     continue
                         
-            data_type = self.modules[module][action]['params'][data_key].get('type') # data type of the source field
-            data_format = self.modules[module][action]['params'][ui_key].get('type', 'text') # format of the returned value: text, raw, url
-            fieldOptions = self.modules[module][action]['params'][ui_key].get('fieldOptions', {})
+            data_type = fields[data_key].get('type') # data type of the source field
+            data_format = fields[ui_key].get('type', 'text') # format of the returned value: text, raw, url
+            fieldOptions = fields[ui_key].get('fieldOptions', {})
 
             source_value = source_value if isinstance(source_value, list) else [source_value]
+            source_value = source_value if data_format == 'url' else store.resolve(source_value)  # ours: /cache reads a url's
             if data_format == 'url':
                 if data_type == 'image':
                     data_value = [f"/cache/{id}/{data_key}/{i}?format={fieldOptions.get('format', 'WEBP')}&quality={fieldOptions.get('quality', 100)}&t={time.time()}"
@@ -1118,11 +1125,9 @@ class WebServer:
         # ours: store the outputs under the node's key; a Dynamic Block node declares its outputs in its folder's config
         if not key:
             return None
-        if hasattr(self.node_cache[id], '_get_custom_config'):
-            declared = self.node_cache[id]._get_custom_config(args['repo_id']).node_params['custom']['params']
-        else:
-            declared = self.modules[module][action]['params']
-        stored = store.put(key, self.node_cache[id].output, declared)
+        if refs is not None:
+            return {"key": key, "stored": True, "ran": False, "outputs": refs}
+        stored = store.put(key, self.node_cache[id].output, fields)
         return {"key": key, "stored": stored is not None, "ran": True, "outputs": stored}
 
 
