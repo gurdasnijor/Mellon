@@ -189,6 +189,8 @@ class Store:
         self.fs, self.root = fsspec.core.url_to_fs(url) if url else (None, None)
         self.local = Path(local)  # where this machine keeps the remote files it has read
         self.found: dict = {}  # the last read()'s stored outputs, by key
+        self.files_url = os.environ.get("MELLON_STORE_FILES")  # s3://<bucket>/<prefix>: where put_file() puts files
+        self._s3 = None
 
     def exists(self, key: str) -> bool:
         if not self.fs:
@@ -320,6 +322,25 @@ class Store:
             return None
         return self.fs.url(f"{self.root}/{value['file']}", expires=3600)
 
+    def put_file(self, path: str, ref: str) -> None:
+        """A file at ref under the root. With files_url (H3's container, beside its mounted bucket) one S3 PUT, its read
+        timeout 10 s, as a stalled request waits it out before its retry: 1.4 s to the mount's 4.7 for 1.5 MB, worst
+        11.8 to 27 (findings §32). Only files: the mount caches a miss for 60 s and doesn't see an S3 write past it, so
+        the marker, which a reader looks up and the executor's refs() misses before the node runs, is through fs."""
+        if not self.files_url:
+            self.fs.makedirs(f"{self.root}/{ref.rsplit('/', 1)[0]}", exist_ok=True)
+            self.fs.put_file(path, f"{self.root}/{ref}")
+            return
+        if self._s3 is None:  # its endpoint and region from AWS_ENDPOINT_URL and AWS_DEFAULT_REGION
+            import boto3
+            from botocore.config import Config
+
+            config = Config(connect_timeout=10, read_timeout=10, retries={"max_attempts": 3, "mode": "standard"})
+            self._s3 = boto3.client("s3", config=config)
+        bucket, _, prefix = self.files_url.removeprefix("s3://").partition("/")
+        with open(path, "rb") as body:
+            self._s3.put_object(Bucket=bucket, Key=f"{prefix}/{ref}", Body=body)
+
     def put(self, key: str, outputs: dict, declared: dict, entry: dict | None = None) -> dict | None:
         """Files first, the marker last, then the node's library entry if it has one. None, and nothing stored, if an
         output is neither JSON nor a file on disk."""
@@ -340,8 +361,7 @@ class Store:
                 refs = []
                 for index, path in enumerate(paths):
                     ref = f"nodes/{key}/{name}/{index}{Path(path).suffix}"
-                    self.fs.makedirs(f"{self.root}/nodes/{key}/{name}", exist_ok=True)
-                    self.fs.put_file(path, f"{self.root}/{ref}")
+                    self.put_file(path, ref)
                     moved["bytes"] = (moved["bytes"] or 0) + os.path.getsize(path)
                     refs.append({"file": ref})
                 stored[name] = refs if isinstance(value, list) else refs[0]
@@ -369,8 +389,7 @@ class Store:
         if not (isinstance(value, str) and os.path.isabs(value) and os.path.isfile(value)):
             return value
         ref = f"nodes/{key}/{name}/{next(index)}{Path(value).suffix}"
-        self.fs.makedirs(f"{self.root}/nodes/{key}/{name}", exist_ok=True)
-        self.fs.put_file(value, f"{self.root}/{ref}")
+        self.put_file(value, ref)
         return {"file": ref}
 
 
