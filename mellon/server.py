@@ -1004,6 +1004,7 @@ class WebServer:
         node_count = sum(len(path) for path in paths)
         task_progress_step = 100 / node_count if node_count > 0 else 100
         task_progress = 0
+        skipped = set()  # ours: nodes with nothing to do, and every node that links one (a spawn input leaves it out)
 
         for path in paths:
             for id in path:
@@ -1017,10 +1018,16 @@ class WebServer:
                     return
 
                 repo_id = nodes[id]['params'].get('repo_id', {}).get('value')  # ours: each node's seconds, by folder and outcome
-                with telemetry.timed(telemetry.node_s, folder=repo_id or f"{nodes[id]['module']}.{nodes[id]['action']}", outcome="failed") as timing:
-                    status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes)
-                    ran = (status['nodes'][id] or {}).get('ran', True)
-                    timing['outcome'] = ("remote" if placement.get(repo_id) else "ran") if ran else "stored"
+                if any(p.get('sourceId') in skipped and not p.get('spawn') for p in nodes[id]['params'].values()):
+                    status['nodes'][id] = {"key": keys[id], "stored": False, "skipped": True}  # ours: not run, spawned or stored
+                else:
+                    with telemetry.timed(telemetry.node_s, folder=repo_id or f"{nodes[id]['module']}.{nodes[id]['action']}", outcome="failed") as timing:
+                        status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes, skipped=skipped)
+                        ran = (status['nodes'][id] or {}).get('ran', True)
+                        timing['outcome'] = "skipped" if (status['nodes'][id] or {}).get('skipped') else ("remote" if placement.get(repo_id) else "ran") if ran else "stored"
+                if (status['nodes'][id] or {}).get('skipped'):
+                    skipped.add(id)
+                    self.queue_message({"type": "skipped", "node": id}, sid)
 
                 # broadcast the task progress
                 if self.current_task:
@@ -1055,7 +1062,7 @@ class WebServer:
         
         return web.json_response({"error": False, "message": "Execution set for interruption."})
 
-    def execute_node(self, id, node, sid, quiet=False, keys=None, nodes=None):
+    def execute_node(self, id, node, sid, quiet=False, keys=None, nodes=None, skipped=()):
         module = node['module']
         action = node['action']
         params = node['params']
@@ -1086,7 +1093,8 @@ class WebServer:
                     spawn_key = p.split('>>>')[0]
                     if not spawn_key in args:
                         args[spawn_key] = []
-
+                    if data_source_id in skipped:  # ours
+                        continue
                     args[spawn_key].append(self.node_cache[data_source_id].output[data_param_key])
                 else:
                     args[p] = self.node_cache[data_source_id].output[data_param_key]
@@ -1213,6 +1221,10 @@ class WebServer:
             if message:
                 self.queue_message(message, sid)
 
+        # ours: a node that ran here and set none of its declared outputs has nothing to do: it is skipped, not stored
+        declared = [n for n, f in fields.items() if f.get('display') == 'output' and n != 'doc']
+        if refs is None and declared and all(self.node_cache[id].output.get(n) is None for n in declared):
+            return {"key": key, "stored": False, "ran": True, "skipped": True}
         # ours: store the outputs under the node's key; a Dynamic Block node declares its outputs in its folder's config
         if not key:
             return None
