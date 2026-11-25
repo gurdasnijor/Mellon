@@ -104,7 +104,7 @@ class WebServer:
 
         # serve the user assets
         try:
-            self.app.add_routes(web.static('/user', 'web/user', append_version=True))
+            self.app.add_routes([web.static('/user', 'web/user', append_version=True)])  # ours: add_routes takes a list; a bare StaticDef raised TypeError, which the except hid, so /user was never served
         except Exception as e:
             pass
 
