@@ -2,7 +2,8 @@
 URL (s3://<bucket>/<prefix>, its endpoint and key in the environment). A node's outputs are nodes/<key>.json under it,
 its files under nodes/<key>/. A file in a value is {"file": "<ref>"}, a path under the root: one another program put
 there, or a stored node's own, such as nodes/<key>/depth_videos/0.mp4. MELLON_NODES names a JSON file of each node
-folder's revision, which `python mellon/store.py blocks/*` prints. A value naming a file on this machine, such as a file
+folder's revision, which `python mellon/store.py nodes.json blocks/*` writes, and where a folder's node runs if not
+here. A value naming a file on this machine, such as a file
 field's path under Mellon's work folder, keys by the file's content: the same path with other bytes is another key, and
 the same bytes under another name or on another host are the same one."""
 
@@ -170,22 +171,20 @@ def revision(folder: Path) -> str:
     return digest.hexdigest()
 
 
-if __name__ == "__main__":  # python -m mellon.store blocks/* > nodes.json
+if __name__ == "__main__":  # python mellon/store.py nodes.json blocks/*: the revisions, the rest of the file kept
     import sys
 
-    print(
-        json.dumps({"nodes": {f: {"revision": revision(Path(f))} for f in sys.argv[1:]}}, indent=2)
-    )
+    out = Path(sys.argv[1])
+    kept = json.loads(out.read_text()) if out.exists() else {}
+    nodes = {f: {"revision": revision(Path(f))} for f in sys.argv[2:]}
+    out.write_text(json.dumps({**kept, "nodes": nodes}, indent=2) + "\n")
 
 store = Store(
     os.environ.get("MELLON_STORE"),
     os.environ.get("MELLON_LOCAL", Path(tempfile.gettempdir()) / "mellon-store"),
 )
-revisions = (
-    {
-        repo: n["revision"]
-        for repo, n in json.loads(Path(os.environ["MELLON_NODES"]).read_text())["nodes"].items()
-    }
-    if os.environ.get("MELLON_NODES")
-    else {}
-)
+_nodes = json.loads(Path(os.environ["MELLON_NODES"]).read_text()) if os.environ.get("MELLON_NODES") else {}
+revisions = {repo: n["revision"] for repo, n in _nodes.get("nodes", {}).items()}
+# Where a folder's node runs when not here: "modal:<app>/<class>", whose run_graph runs it (mellon/remote.py). Not in
+# a key, so moving a node between hosts never changes one.
+placement = _nodes.get("placement", {})

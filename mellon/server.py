@@ -17,7 +17,8 @@ logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
-from mellon.store import store, revisions, graph_keys
+from mellon.store import store, revisions, graph_keys, placement
+from mellon import remote
 from modules import MODULE_MAP
 from utils.huggingface import get_local_models, delete_model, search_hub, download_hub_model, get_local_model_ids
 from utils.torch_utils import reset_memory_stats, get_memory_stats
@@ -935,7 +936,7 @@ class WebServer:
                     }, sid)
                     return
 
-                status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys)
+                status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes)
 
                 # broadcast the task progress
                 if self.current_task:
@@ -970,7 +971,7 @@ class WebServer:
         
         return web.json_response({"error": False, "message": "Execution set for interruption."})
 
-    def execute_node(self, id, node, sid, quiet=False, keys=None):
+    def execute_node(self, id, node, sid, quiet=False, keys=None, nodes=None):
         module = node['module']
         action = node['action']
         params = node['params']
@@ -1039,6 +1040,12 @@ class WebServer:
         # ours: a node stored under its key is not run, here or on any machine sharing the store, but shows its previews
         key = keys[id] if keys else None
         refs = store.refs(key) if key else None
+        place = placement.get(params.get('repo_id', {}).get('value')) if key and nodes and refs is None else None
+        if place:  # ours: a node placed elsewhere (nodes.json) runs there, and its outputs are read from the store
+            remote.run(place, id, nodes, keys, revisions[params['repo_id']['value']], CONFIG.paths['work_dir'], lambda: self.interrupt_flag)
+            refs = store.refs(key)
+            if refs is None:
+                raise RuntimeError(f"{place} ran node {id} but stored no outputs")
         if refs is not None:
             node.output = refs  # read from the store only where it is used: by a node that runs here, or /cache
             self.queue_message({"type": "executed", "node": id, "name": f"{module}.{action}", "stored": True}, sid)
@@ -1126,7 +1133,7 @@ class WebServer:
         if not key:
             return None
         if refs is not None:
-            return {"key": key, "stored": True, "ran": False, "outputs": refs}
+            return {"key": key, "stored": True, "ran": bool(place), "outputs": refs}
         stored = store.put(key, self.node_cache[id].output, fields)
         return {"key": key, "stored": stored is not None, "ran": True, "outputs": stored}
 
