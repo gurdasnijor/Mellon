@@ -10,6 +10,7 @@ the same bytes under another name or on another host are the same one."""
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path, PurePosixPath
 
@@ -22,9 +23,11 @@ RUNNER = {
     "auto_offload",
     "trust_remote_code",
     "load_block_button",
-}  # where it runs, not what it makes
+    "library",
+}  # where it runs, or a control on the node (the Library field), not what it makes
 MELLON = "mellon@5fd24292"  # the revision of a node that is not a folder: Mellon's own, at our fork's base
 FILES = ("video", "image", "file")
+SHA256 = re.compile(r"sha256:([0-9a-f]{64})")  # a file named by its content, as a library entry names it
 
 
 _hashes: dict = {}  # a file's SHA-256 by (path, size, mtime), so an unchanged file is read once per process
@@ -46,6 +49,8 @@ def content(value, work_dir: Path):
     """A param's value with each string that names a file here as {"sha256": …}."""
     if isinstance(value, list):
         return [content(v, work_dir) for v in value]
+    if isinstance(value, str) and (named := SHA256.fullmatch(value)):
+        return {"sha256": named[1]}
     path = file_here(value, work_dir)
     if path is None:
         return value
@@ -89,6 +94,28 @@ def graph_keys(nodes: dict, revisions: dict, work_dir: str | Path = ".") -> dict
     for node_id in nodes:
         key(node_id)
     return keys
+
+
+def library_entry(params: dict, revision: str | None, work_dir: str | Path, outputs: dict) -> dict | None:
+    """A stored node's library entry, if no link feeds it (a clip, a person): its folder, revision and params as its
+    key reads them, a file as sha256:<hex>, so writing them back into a node of that folder gives the same key and
+    so its stored result, even once the file is gone; and a name, an output's "name" if it has one."""
+    folder = params.get("repo_id", {}).get("value")
+    if not folder or any(p.get("sourceId") for p in params.values()):
+        return None
+
+    def named(value):
+        if isinstance(value, list):
+            return [named(v) for v in value]
+        return f"sha256:{value['sha256']}" if isinstance(value, dict) and set(value) == {"sha256"} else value
+
+    values = {
+        name: named(content(p.get("value"), Path(work_dir)))
+        for name, p in params.items()
+        if name not in RUNNER and name != "repo_id" and not p.get("display", "").startswith("ui_") and p.get("display") != "output"
+    }
+    name = next((v["name"] for v in outputs.values() if isinstance(v, dict) and isinstance(v.get("name"), str)), None)
+    return {"folder": folder, "revision": revision, "name": name, "params": values}
 
 
 class Stale(Exception):
@@ -176,8 +203,31 @@ class Store:
                 raise Stale(ref) from e
             raise
 
-    def put(self, key: str, outputs: dict, declared: dict) -> dict | None:
-        """Files first, the marker last. None, and nothing stored, if an output is neither JSON nor a file on disk."""
+    def library(self, folder: str) -> list[dict]:
+        """A folder's library: the entries its stored nodes wrote, each with its key and when it was stored."""
+        base = f"{self.root}/libraries/{folder}/"
+        if not self.fs or not self.fs.exists(base):
+            return []
+        found = {p: i for p, i in self.fs.find(base, detail=True).items() if p.endswith(".json")}
+        data = self.fs.cat(list(found)) if found else {}
+        entries = []
+        for path, info in found.items():
+            stored = info.get("mtime") or info.get("LastModified")
+            stored = stored.timestamp() if hasattr(stored, "timestamp") else stored
+            entries.append({"key": path.rsplit("/", 1)[1][: -len(".json")], "modified": stored, **json.loads(data[path])})
+        return sorted(entries, key=lambda e: -(e["modified"] or 0))
+
+    def url(self, value) -> str | None:
+        """A stored file's presigned URL, which answers range reads, so a player streams it from the bucket rather than
+        through this machine; None for a folder store or a value that is not {"file": ref}. botocore signs for its
+        region: R2's is auto (AWS_DEFAULT_REGION), or the URL is refused."""
+        if not (isinstance(value, dict) and set(value) == {"file"} and self.fs) or isinstance(self.fs, LocalFileSystem):
+            return None
+        return self.fs.url(f"{self.root}/{value['file']}", expires=3600)
+
+    def put(self, key: str, outputs: dict, declared: dict, entry: dict | None = None) -> dict | None:
+        """Files first, the marker last, then the node's library entry if it has one. None, and nothing stored, if an
+        output is neither JSON nor a file on disk."""
         if not self.fs:
             return None
         stored = {}
@@ -204,6 +254,9 @@ class Store:
                     )
                 stored[name] = self._files(value, key, name, iter(range(1 << 30)))
         self.fs.pipe_file(f"{self.root}/nodes/{key}.json", json.dumps(stored).encode())
+        if entry:
+            self.fs.makedirs(f"{self.root}/libraries/{entry['folder']}", exist_ok=True)
+            self.fs.pipe_file(f"{self.root}/libraries/{entry['folder']}/{key}.json", json.dumps(entry).encode())
         return stored
 
     def _files(self, value, key: str, name: str, index):

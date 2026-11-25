@@ -17,7 +17,7 @@ logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
-from mellon.store import store, revisions, graph_keys, placement, graph_path, Stale
+from mellon.store import store, revisions, graph_keys, placement, graph_path, Stale, library_entry
 from mellon import remote
 from modules import MODULE_MAP
 from utils.huggingface import get_local_models, delete_model, search_hub, download_hub_model, get_local_model_ids
@@ -571,12 +571,16 @@ class WebServer:
         if isinstance(data, list):
             index = max(0, min(len(data) - 1, int(index))) if index else 0
             data = data[index]
-        data = store.resolve(data)  # ours: a stored output, read from the store when it is opened
 
         # check the registry for the type of the field
         module = self.node_cache[node].module_name
         action = self.node_cache[node].class_name
         type = getattr(self.node_cache[node], '_fields', self.modules[module][action]['params'])[field].get('type')  # ours
+
+        # ours: a stored file plays from the bucket (a presigned URL answers ranges); anything else is read from the store
+        if any(t in ('video', 'audio', 'file', '3d') for t in (type if isinstance(type, list) else [type])) and (url := store.url(data)):
+            raise web.HTTPFound(url)
+        data = store.resolve(data)
 
         filename = request.query.get('filename', f"{field}")
 
@@ -639,6 +643,13 @@ class WebServer:
     async def listdir(self, request):
         req_basepath = self.data_dir if request.query.get('basepath') == 'data' else self.work_dir
         req_path = request.query.get('path', req_basepath)
+        if req_path.startswith('store:'):  # ours: store:<folder> lists that folder's library at its current revision
+            folder = req_path.removeprefix('store:')
+            current = revisions.get(folder)
+            entries = [e for e in store.library(folder) if current is None or e['revision'] == current]
+            files = [{'is_dir': False, 'is_hidden': False, 'name': e['name'] or e['key'][:12], 'path': f"store:nodes/{e['key']}",
+                      'modified': e['modified'], 'size': None, 'ext': None, 'type': 'other', 'key': e['key'], 'params': e['params']} for e in entries]
+            return web.json_response({'files': files, 'path': req_path, 'abs_path': req_path})
         req_type = request.query.get('type', None)
         if req_type:
             req_type = [t.strip() for t in req_type.lower().split(',')]
@@ -766,6 +777,8 @@ class WebServer:
 
         if file.startswith('store:'):  # ours: a saved graph in the store, with its ETag for a save to send back
             ref = file.removeprefix('store:')
+            if ref.startswith('nodes/'):
+                return self.stored_file(ref)
             found = store.graph(ref) if ref.startswith('graphs/') else None
             if not found:
                 return web.json_response({"error": f"The file {file} does not exist."}, status=404)
@@ -880,10 +893,20 @@ class WebServer:
             }
         )
     
+    def stored_file(self, ref):
+        """ours: a node's stored file, store:nodes/<key>/…: from the bucket by a presigned URL, or from a folder store."""
+        if not (store.fs and '..' not in ref.split('/') and store.fs.exists(f"{store.root}/{ref}")):
+            return web.json_response({"error": f"The file store:{ref} does not exist."}, status=404)
+        if url := store.url({"file": ref}):
+            raise web.HTTPFound(url)
+        return web.FileResponse(store.resolve({"file": ref}))
+
     async def stream(self, request):
         file = request.query.get('file')
         if not file:
             return web.json_response({"error": "Incorrect request, `file` is required."}, status=400)
+        if file.startswith('store:nodes/'):  # ours
+            return self.stored_file(file.removeprefix('store:'))
 
         file_path = Path(file)
         if not file_path.is_absolute():
@@ -1164,7 +1187,9 @@ class WebServer:
             return None
         if refs is not None:
             return {"key": key, "stored": True, "ran": bool(place), "outputs": refs}
-        stored = store.put(key, self.node_cache[id].output, fields)
+        output = self.node_cache[id].output
+        repo_id = params.get('repo_id', {}).get('value')
+        stored = store.put(key, output, fields, library_entry(params, revisions.get(repo_id), CONFIG.paths['work_dir'], output))  # ours: a source node is in its folder's library
         return {"key": key, "stored": stored is not None, "ran": True, "outputs": stored}
 
 
