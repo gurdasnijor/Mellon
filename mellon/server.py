@@ -598,6 +598,10 @@ class WebServer:
         action = self.node_cache[node].class_name
         type = getattr(self.node_cache[node], '_fields', self.modules[module][action]['params'])[field].get('type')  # ours
 
+        # ours: a reference ({video|image|audio: file, …}, an H3 node's) previews as its file
+        if isinstance(data, dict) and len(kinds := [k for k in ('video', 'image', 'audio') if k in data]) == 1:
+            data, type = data[kinds[0]], 'file'
+
         # ours: a stored file plays from the bucket (a presigned URL answers ranges); anything else is read from the store
         if any(t in ('video', 'audio', 'file', '3d') for t in (type if isinstance(type, list) else [type])) and (url := store.url(data)):
             raise web.HTTPFound(url)
