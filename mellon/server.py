@@ -1054,14 +1054,25 @@ class WebServer:
             keys, stored, skipped = self.check(nodes)
             status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": stored[i]} for i, k in keys.items()}}
         # ours: a post that runs a node placed elsewhere (a render) is kept as a saved graph, the canvas as it was run,
-        # beside the composition it was opened from, at its first spawn (a skipped render keeps nothing); its keys find its takes
-        self.keep_render = (lambda: store.save_graph(render_path(graph.get('saved'), time.time()), json.dumps({**graph['canvas'], 'keys': keys}).encode(), None)) if graph.get('canvas') and store.fs else None  # and its keys, which find its videos (/renders)
+        # beside the composition it was opened from, at its first spawn (a skipped render keeps nothing); its keys find
+        # its takes (/renders), and its outcome is written into it as the run ends
+        kept = {}
+
+        def keep():
+            kept.update(ref=render_path(graph.get('saved'), time.time()), record={**graph['canvas'], 'keys': keys})
+            kept['etag'] = store.save_graph(kept['ref'], json.dumps(kept['record']).encode(), None)
+        self.keep_render = keep if graph.get('canvas') and store.fs else None
+        outcome = {"state": "failed", "error": None}
         try:
             stopped = self._execute_paths(sid, paths, nodes, keys, status, skipped)  # ours: whether Stop left nodes unrun
+            outcome["state"] = status["state"] = "stopped" if stopped else "done"  # ours: a run Stop ended isn't done
         except Exception as e:
             status.update(state="failed", error=f"{type(e).__name__}: {e}")
+            outcome["error"] = str(e.__context__ or e)  # what the canvas shows of it ('failed')
             raise
-        status["state"] = "stopped" if stopped else "done"  # ours: a run Stop ended isn't done
+        finally:
+            if kept:
+                store.save_graph(kept['ref'], json.dumps({**kept['record'], 'outcome': outcome}).encode(), kept['etag'])
         return status["state"]
 
     class NotRun(Exception):

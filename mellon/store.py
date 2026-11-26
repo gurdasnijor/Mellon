@@ -284,8 +284,8 @@ class Store:
 
     def renders(self) -> list[dict]:
         """Every render kept with its run's keys, newest first: where it is saved, the graph it was opened from, when it
-        ran, and its videos as the store has them now, the finished ones if any is stored, else the takes stored so
-        far. A render kept without keys (before they were kept) is left out."""
+        ran, how its run ended, and its videos as the store has them now, the finished ones if any is stored, else the
+        takes stored so far. A render kept without keys (before they were kept) is left out."""
         saved = [g for g in self.graphs() if g.startswith("renders/") or "/renders/" in g]
         if not saved:
             return []
@@ -318,6 +318,7 @@ class Store:
                 "time": stamp.removesuffix(".json"),
                 "finished": bool(done),
                 "videos": done or stored(takes),
+                "outcome": canvas.get("outcome"),  # how its run ended, {state: done|stopped|failed, error}; none while it runs
             })
         return sorted(renders, key=lambda r: r["time"], reverse=True)
 
