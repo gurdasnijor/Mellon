@@ -19,7 +19,7 @@ logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
-from mellon.store import store, revisions, graph_keys, placement, graph_path, Stale, library_entry, render_path, SHA256
+from mellon.store import store, revisions, graph_keys, placement, graph_path, Stale, library_entry, render_path, SHA256, skips
 import os
 import tempfile
 from mellon import remote, telemetry
@@ -1010,22 +1010,27 @@ class WebServer:
     
     def check(self, nodes):
         """ours: every node's key, whether or not this server runs it (a file by its content), and whether it is stored,
-        from every node's stored outputs read in one pass, which refs() then answers from"""
+        from every node's stored outputs read in one pass, which refs() then answers from; and the nodes skipped: stored
+        so, or linking one skipped by a non-spawn input, as a run skips it"""
         with telemetry.timed(telemetry.store_s, op="keys"):
             keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'])
         found = store.read(keys.values())
-        return keys, {i: found[k] is not None for i, k in keys.items()}
+        skipped = {i for i, k in keys.items() if skips(found[k])}
+        while more := {i for i in keys if i not in skipped and any(p.get('sourceId') in skipped and not p.get('spawn') for p in nodes[i]['params'].values())}:
+            skipped |= more
+        return keys, {i: found[k] is not None for i, k in keys.items()}, skipped
 
     async def stored(self, request):
-        """ours: POST an exported graph ({nodes}); answers {id: key or null}, the key each node is stored under, by the
-        check a run starts with, running nothing, so the canvas shows what the store holds when a graph opens or an edit
-        moves a key, and no result of another key. With {sid, paths, show}, the nodes in show that are stored then draw
+        """ours: POST an exported graph ({nodes}); answers {keys: {id: key or null}, skipped: [id]}, the key each node is
+        stored under (none for one skipped) and the nodes a run skips, by the check a run starts with, running nothing,
+        so the canvas shows what the store holds when a graph opens or an edit moves a key, and no result of another key. With {sid, paths, show}, the nodes in show that are stored then draw
         their results on that canvas, unless a task runs (its own do)"""
         graph = await request.json()
-        keys, stored = await asyncio.to_thread(self.check, graph['nodes'])
+        keys, stored, skipped = await asyncio.to_thread(self.check, graph['nodes'])
+        stored = {i: stored[i] and i not in skipped for i in keys}  # one skipped has no outputs to show
         if graph.get('sid') and graph.get('show') and not self.current_task and not self.queued_tasks:
             self.showing = asyncio.create_task(asyncio.to_thread(self.show, graph, keys, stored))
-        return web.json_response({i: keys[i] if stored.get(i) else None for i in keys})
+        return web.json_response({"keys": {i: keys[i] if stored[i] else None for i in keys}, "skipped": sorted(skipped)})
 
     def show(self, graph, keys, stored):
         """ours: each stored node in show, in the paths' order, goes through execute_node as a run that finds it stored
@@ -1046,13 +1051,13 @@ class WebServer:
         nodes = graph['nodes']
         paths = graph['paths']
         with telemetry.timed(telemetry.store_s, op="check"):  # ours: the run's check, its keys and whether each is stored
-            keys, stored = self.check(nodes)
+            keys, stored, skipped = self.check(nodes)
             status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": stored[i]} for i, k in keys.items()}}
         # ours: a post that runs a node placed elsewhere (a render) is kept as a saved graph, the canvas as it was run,
         # beside the composition it was opened from, at its first spawn (a skipped render keeps nothing); its keys find its takes
         self.keep_render = (lambda: store.save_graph(render_path(graph.get('saved'), time.time()), json.dumps({**graph['canvas'], 'keys': keys}).encode(), None)) if graph.get('canvas') and store.fs else None  # and its keys, which find its videos (/renders)
         try:
-            stopped = self._execute_paths(sid, paths, nodes, keys, status)  # ours: whether Stop left nodes unrun
+            stopped = self._execute_paths(sid, paths, nodes, keys, status, skipped)  # ours: whether Stop left nodes unrun
         except Exception as e:
             status.update(state="failed", error=f"{type(e).__name__}: {e}")
             raise
@@ -1064,13 +1069,14 @@ class WebServer:
 
     keeping = threading.Lock()  # ours: keep_render's, taken at a spawn, which a render's own thread makes
 
-    def _execute_paths(self, sid, paths, nodes, keys, status):
+    def _execute_paths(self, sid, paths, nodes, keys, status, skipped):
         """Ours: each node once. A placed node not stored runs on a thread of its own as soon as the nodes it links
         from are done, at most remote.IN_FLIGHT spawned at once, so a graph's renders are in flight together; every
         other node runs here, in the paths' order, once the nodes it links from are done. A piece carried on from the
         one before links from it, so it waits for it. What the nodes it links from did decides, in one walk, what a
         node does: if one failed, it isn't run, and nor is any node after it; if a non-spawn input links a skipped
-        one, it is skipped too (not run, spawned or stored); a spawn input leaves skipped ones out. Every render is
+        one, it is skipped too (not run, spawned or stored), and is said so as soon as that one is, as are those the check
+        found skipped as the run starts; a spawn input leaves skipped ones out. Every render is
         waited for before the first error is raised, so one that fails leaves the others' takes stored and shown."""
         graph_execution_time = time.time()
         order = list(dict.fromkeys(i for path in paths for i in path))
@@ -1079,6 +1085,22 @@ class WebServer:
         done = {i: Future() for i in order if i not in placed}  # each node's status once done, or why it isn't
         finished, progress, in_flight = [0], threading.Lock(), threading.Semaphore(remote.IN_FLIGHT)
         running = self.current_task['running'] if self.current_task else {}  # ours: for a page opened mid-run (/queue)
+        skipping, skips_lock = {i for i in order if i in skipped}, threading.Lock()  # ours: the nodes skipped, each said so once
+        for i in order:  # the check's: stored so, or after one that is
+            if i in skipping:
+                self.queue_message({"type": "skipped", "node": i}, sid)
+
+        def skip(id):
+            """ours: a skipped node and every node after it by non-spawn links are skipped at once, so the canvas hides
+            a lane past the plan as soon as its Piece node is skipped, not as the run reaches the lane"""
+            with skips_lock:
+                new, frontier = [], {id} - skipping
+                while frontier:
+                    skipping.update(frontier)
+                    new += [i for i in order if i in frontier]
+                    frontier = {i for i in order if i not in skipping and any(s in frontier and not spawn for s, spawn in links[i])}
+            for i in new:
+                self.queue_message({"type": "skipped", "node": i}, sid)
 
         def run(id, skipped):
             running[id] = True
@@ -1088,25 +1110,26 @@ class WebServer:
                 running.pop(id, None)
 
         def execute(id):
-            if failed := list(dict.fromkeys(s for s, _ in links[id] if done[s].exception() is not None)):  # waits for them
+            if id in skipping:  # ours: skipped already, by a node before it, so it waits for none
+                status['nodes'][id] = {"key": keys[id], "stored": False, "skipped": True}
+            elif failed := list(dict.fromkeys(s for s, _ in links[id] if done[s].exception() is not None)):  # waits for them
                 raise self.NotRun(f"Not run: {', '.join(failed)}, which it links from, did not run")
-            skipped = {s for s, _ in links[id] if (done[s].result() or {}).get('skipped')}
-            repo_id = nodes[id]['params'].get('repo_id', {}).get('value')  # each node's seconds, by folder and outcome
-            if any(s in skipped and not spawn for s, spawn in links[id]):
+            elif any(s in skipping and not spawn for s, spawn in links[id]):
                 status['nodes'][id] = {"key": keys[id], "stored": False, "skipped": True}  # not run, spawned or stored
             else:
+                repo_id = nodes[id]['params'].get('repo_id', {}).get('value')  # each node's seconds, by folder and outcome
                 with telemetry.timed(telemetry.node_s, folder=repo_id or f"{nodes[id]['module']}.{nodes[id]['action']}", outcome="failed") as timing:
                     if id in placed:
                         with in_flight:
                             if self.interrupt_flag:
                                 raise self.NotRun("Not run: stopped before it was spawned")
-                            status['nodes'][id] = run(id, skipped)
+                            status['nodes'][id] = run(id, skipping)
                     else:
-                        status['nodes'][id] = run(id, skipped)
+                        status['nodes'][id] = run(id, skipping)
                     ran = (status['nodes'][id] or {}).get('ran', True)
                     timing['outcome'] = "skipped" if (status['nodes'][id] or {}).get('skipped') else ("remote" if placement.get(repo_id) else "ran") if ran else "stored"
             if (status['nodes'][id] or {}).get('skipped'):
-                self.queue_message({"type": "skipped", "node": id}, sid)
+                skip(id)
             if self.current_task:  # broadcast the task progress
                 with progress:
                     finished[0] += 1
@@ -1343,7 +1366,9 @@ class WebServer:
         # ours: a node that ran here and set none of its declared outputs has nothing to do: it is skipped, not stored
         declared = [n for n, f in fields.items() if f.get('display') == 'output' and n != 'doc']
         if refs is None and declared and all(self.node_cache[id].output.get(n) is None for n in declared):
-            return {"key": key, "stored": False, "ran": True, "skipped": True}
+            # stored so, every output null: its key is its inputs', so it is skipped again (a lane past the plan)
+            stored = store.put(key, dict.fromkeys(declared), {}) if key else None
+            return {"key": key, "stored": stored is not None, "ran": True, "skipped": True}
         # ours: store the outputs under the node's key; a Dynamic Block node declares its outputs in its folder's config
         if not key:
             return None
