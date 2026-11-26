@@ -1,6 +1,9 @@
 aiohttp
 aiohttp_cors
 nanoid
+# ours: the store (mellon/store.py)
+fsspec
+rfc8785
 git+https://github.com/huggingface/diffusers
 transformers
 accelerate

@@ -13,13 +13,27 @@ from pathlib import Path
 import traceback
 import time
 from copy import deepcopy
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
+from mellon.store import store, revisions, graph_keys, placement, graph_path, Stale, library_entry, render_path, SHA256, skips
+import os
+import tempfile
+from mellon import remote, telemetry
 from modules import MODULE_MAP
+telemetry.configure()  # ours: before the app is made, so aiohttp's instrumentation sees it
 from utils.huggingface import get_local_models, delete_model, search_hub, download_hub_model, get_local_model_ids
 from utils.torch_utils import reset_memory_stats, get_memory_stats
+
+async def revalidated(request, response):
+    """Ours: the client's files are asked for again on each load, a 304 when unchanged, as index.html already is: their
+    names have no hash, so a browser that kept them would run an old client after a deploy."""
+    if request.path.startswith(('/assets/', '/user/')):
+        response.headers['Cache-Control'] = 'no-cache'
+
 
 class WebServer:
     def __init__(
@@ -44,6 +58,7 @@ class WebServer:
 
         self.interrupt_flag = False
         self.node_cache = {}
+        self.tasks = {}  # ours: each graph's state for GET /graph/{task_id}, kept while the server runs (unbounded)
 
         self.queued_tasks = {}
         self.current_task = {}
@@ -69,6 +84,7 @@ class WebServer:
         self.work_dir = work_dir
         self.data_dir = data_dir
         self.app = web.Application(client_max_size=self.client_max_size)
+        self.app.on_response_prepare.append(revalidated)  # ours
 
         # set up the routes
         self.app.add_routes([
@@ -83,10 +99,14 @@ class WebServer:
             web.delete('/cache', self.delete_cache),
             web.get('/listdir', self.listdir),
             web.get('/listgraphs', self.listgraphs),
+            web.put('/graphs/{path:.+}', self.save_graph),
+            web.get('/renders', self.renders),
             web.get('/file', self.fileGet),
             web.post('/file', self.filePost),
             web.get('/preview', self.preview),
             web.post('/graph', self.graph),
+            web.get('/graph/{task_id}', self.graph_status),
+            web.post('/stored', self.stored),  # ours
             web.get('/queue', self.get_queue),
             web.delete('/queue/{task_id}', self.delete_task),
             web.get('/stop', self.stop_execution),
@@ -101,7 +121,7 @@ class WebServer:
 
         # serve the user assets
         try:
-            self.app.add_routes(web.static('/user', 'web/user', append_version=True))
+            self.app.add_routes([web.static('/user', 'web/user', append_version=True)])  # ours: add_routes takes a list; a bare StaticDef raised TypeError, which the except hid, so /user was never served
         except Exception as e:
             pass
 
@@ -214,6 +234,8 @@ class WebServer:
                 "sid": self.current_task["sid"],
                 "started_at": self.current_task["started_at"],
                 "progress": self.current_task["progress"],
+                "running": list(self.current_task.get("running", ())),  # ours: its nodes running now, and whether Stop
+                "stopping": self.interrupt_flag,  # was pressed: a page opened mid-run shows both, Stop's "stopping after"
             }
         
         return queued_tasks, current_task
@@ -241,7 +263,16 @@ class WebServer:
             "queued": task_list,
             "current": current_task,
         })
-        
+        return task_id  # ours: POST /graph answered task_id null without it
+
+    async def graph_status(self, request):
+        """Ours: {state: running | done | failed, error, nodes: {id: {key, stored, ran?, outputs?}}}, every node of the graph."""
+        task_id = request.match_info["task_id"]
+        if task_id in self.queued_tasks or (task_id not in self.tasks and (self.current_task or {}).get("task_id") == task_id):
+            return web.json_response({"state": "queued"})
+        task = self.tasks.get(task_id)
+        return web.json_response(task) if task else web.json_response({"error": True, "message": "No such graph."}, status=404)
+
     async def get_queue(self, _):
         """
         HTTP endpoint to return the tasks queue and the current task.
@@ -300,7 +331,11 @@ class WebServer:
                         "task_id": task_id,
                         "task": task,
                         "name": current_task["name"],
-                        "sid": current_task["sid"],
+                        # ours: the page it reports to, the one it was posted from or, if that has gone (a reload while
+                        # it was queued), the one that connected last; run_sid, the page it was posted from
+                        "sid": current_task["sid"] if current_task["sid"] in self.ws_sessions else next(reversed(self.ws_sessions), current_task["sid"]),
+                        "run_sid": current_task["sid"],
+                        "running": {},  # ours: its nodes running now, in the order they started
                         "started_at": time.time(),
                         "progress": 0,
                         "args": args,
@@ -561,7 +596,16 @@ class WebServer:
         # check the registry for the type of the field
         module = self.node_cache[node].module_name
         action = self.node_cache[node].class_name
-        type = self.modules[module][action]['params'][field].get('type')
+        type = getattr(self.node_cache[node], '_fields', self.modules[module][action]['params'])[field].get('type')  # ours
+
+        # ours: a reference ({video|image|audio: file, …}, an H3 node's) previews as its file
+        if isinstance(data, dict) and len(kinds := [k for k in ('video', 'image', 'audio') if k in data]) == 1:
+            data, type = data[kinds[0]], 'file'
+
+        # ours: a stored file plays from the bucket (a presigned URL answers ranges); anything else is read from the store
+        if any(t in ('video', 'audio', 'file', '3d') for t in (type if isinstance(type, list) else [type])) and (url := store.url(data)):
+            raise web.HTTPFound(url)
+        data = store.resolve(data)
 
         filename = request.query.get('filename', f"{field}")
 
@@ -624,6 +668,13 @@ class WebServer:
     async def listdir(self, request):
         req_basepath = self.data_dir if request.query.get('basepath') == 'data' else self.work_dir
         req_path = request.query.get('path', req_basepath)
+        if req_path.startswith('store:'):  # ours: store:<folder> lists that folder's library at its current revision
+            folder = req_path.removeprefix('store:')
+            current = revisions.get(folder)
+            entries = [e for e in store.library(folder) if current is None or e['revision'] == current]
+            files = [{'is_dir': False, 'is_hidden': False, 'name': e['name'] or e['key'][:12], 'path': f"store:nodes/{e['key']}",
+                      'modified': e['modified'], 'size': None, 'ext': None, 'type': 'other', 'key': e['key'], 'params': e['params']} for e in entries]
+            return web.json_response({'files': files, 'path': req_path, 'abs_path': req_path})
         req_type = request.query.get('type', None)
         if req_type:
             req_type = [t.strip() for t in req_type.lower().split(',')]
@@ -689,10 +740,12 @@ class WebServer:
 
     async def listgraphs(self, request):
         path = Path(self.data_dir) / 'graphs'
-        if not path.exists():
+        saved = store.graphs()  # ours: the store's saved graphs, listed as the folder "saved"
+        if not path.exists() and not saved:
             return web.json_response({"error": True, "message": "No graph directory found."}, status=404)
         
-        graphs = list_files(str(path), recursive=True, extensions=['json'])
+        graphs = list_files(str(path), recursive=True, extensions=['json']) if path.exists() else []
+        graphs += [{"rel_directory": str(Path("saved") / Path(g).parent), "name": Path(g).name, "path": f"store:graphs/{g}"} for g in saved]
 
         # build a nested tree of directories and files
         tree: list[dict] = []
@@ -741,12 +794,27 @@ class WebServer:
 
         return web.json_response(tree)
 
+    async def renders(self, request):
+        """ours: the renders kept as saved graphs, newest first, each with its videos in the store (the Gallery)."""
+        return web.json_response(await asyncio.to_thread(store.renders) if store.fs else [])
+
     async def fileGet(self, request):
         file = request.query.get('file')
 
         if not file:
             return web.json_response({"error": "Incorrect request, `file` is required."}, status=400)
-        
+
+        if file.startswith('store:'):  # ours: a saved graph in the store, with its ETag for a save to send back
+            ref = file.removeprefix('store:')
+            if ref.startswith('nodes/'):
+                return self.stored_file(ref)
+            found = store.graph(ref) if ref.startswith('graphs/') else None
+            if not found:
+                return web.json_response({"error": f"The file {file} does not exist."}, status=404)
+            return web.Response(body=found[0], content_type='application/json', headers={'ETag': found[1], 'Cache-Control': 'no-cache'})
+        if named := SHA256.fullmatch(file):  # ours: an upload or a library entry's file, from the store
+            return self.stored_file(f"files/{named[1]}/{named[2]}")
+
         file_path = Path(file)
         if not file_path.is_absolute():
             file_path = Path(self.work_dir) / file_path
@@ -756,11 +824,42 @@ class WebServer:
         
         return web.FileResponse(file_path)
 
+    async def save_graph(self, request):
+        """ours: PUT /graphs/<workspace>/<name>.json saves the canvas's graph to the store. With If-Match, only over the
+        graph as it was opened; without, only where none is: anything else is 412, as a save from a stale tab."""
+        ref = graph_path(request.match_info['path'])
+        if not ref:
+            return web.json_response({"error": "A saved graph's path is <workspace>/<name>.json."}, status=400)
+        if not store.fs:
+            return web.json_response({"error": "No store to save to: set MELLON_STORE."}, status=404)
+        data = await request.read()
+        try:
+            graph = json.loads(data)
+            assert isinstance(graph, dict) and 'nodes' in graph and 'edges' in graph
+        except (ValueError, AssertionError):
+            return web.json_response({"error": "Not a graph: the canvas's nodes, edges and viewport."}, status=400)
+        try:
+            etag = store.save_graph(ref, data, request.headers.get('If-Match'))
+        except Stale:
+            return web.json_response({"error": f"{request.match_info['path']} has changed since it was opened, or already exists."}, status=412)
+        return web.json_response({"path": f"store:{ref}", "etag": etag}, headers={'ETag': etag})
+
     async def filePost(self, request):
         data = await request.post()
         file = data.get('file')
         type = data.get('type', 'images')
         type = type if type in ['images', 'audio', 'videos', 'text', '3d'] else 'images'
+        if store.fs:  # ours: put in the store by its content and name, which any host reads it by
+            fd, part = tempfile.mkstemp(suffix=Path(file.filename).suffix)
+            try:
+                with open(fd, 'wb') as f:
+                    f.write(file.file.read())
+                return web.json_response({"error": False, "path": await asyncio.to_thread(store.put_named, part, file.filename)})
+            except Exception as e:
+                logger.error(f"Error storing file: {e}")
+                return web.json_response({"error": str(e)}, status=500)
+            finally:
+                os.remove(part)
         file_path = Path(self.data_dir) / type / file.filename
 
         if file_path.exists():
@@ -786,13 +885,19 @@ class WebServer:
         file = request.query.get('file')
         if not file:
             return web.json_response({"error": "Incorrect request, `file` is required."}, status=400)
-        
-        file_path = Path(file)
-        if not file_path.is_absolute():
-            file_path = Path(self.work_dir) / file_path
 
-        if not str(file_path).startswith(self.work_dir):
-            return web.json_response({"error": f"Cannot access paths outside of {self.work_dir}."}, status=403)
+        if SHA256.fullmatch(file):  # ours: an upload or a library entry's file, read from the store once
+            try:
+                file_path = Path(await asyncio.to_thread(store.resolve, file))
+            except FileNotFoundError:
+                return web.json_response({"error": f"The file {file} does not exist."}, status=404)
+        else:
+            file_path = Path(file)
+            if not file_path.is_absolute():
+                file_path = Path(self.work_dir) / file_path
+
+            if not str(file_path).startswith(self.work_dir):
+                return web.json_response({"error": f"Cannot access paths outside of {self.work_dir}."}, status=403)
 
         if not file_path.exists():
             return web.json_response({"error": f"The file {file} does not exist."}, status=404)
@@ -836,10 +941,22 @@ class WebServer:
             }
         )
     
+    def stored_file(self, ref):
+        """ours: a node's stored file, store:nodes/<key>/…: from the bucket by a presigned URL, or from a folder store."""
+        if not (store.fs and '..' not in ref.split('/') and store.fs.exists(f"{store.root}/{ref}")):
+            return web.json_response({"error": f"The file store:{ref} does not exist."}, status=404)
+        if url := store.url({"file": ref}):
+            raise web.HTTPFound(url)
+        return web.FileResponse(store.resolve({"file": ref}))
+
     async def stream(self, request):
         file = request.query.get('file')
         if not file:
             return web.json_response({"error": "Incorrect request, `file` is required."}, status=400)
+        if file.startswith('store:nodes/'):  # ours
+            return self.stored_file(file.removeprefix('store:'))
+        if named := SHA256.fullmatch(file):  # ours: an upload or a library entry's file
+            return self.stored_file(f"files/{named[1]}/{named[2]}")
 
         file_path = Path(file)
         if not file_path.is_absolute():
@@ -891,39 +1008,187 @@ class WebServer:
             "task_id": task_id,
         })
     
+    def check(self, nodes):
+        """ours: every node's key, whether or not this server runs it (a file by its content), and whether it is stored,
+        from every node's stored outputs read in one pass, which refs() then answers from; and the nodes skipped: stored
+        so, or linking one skipped by a non-spawn input, as a run skips it"""
+        with telemetry.timed(telemetry.store_s, op="keys"):
+            keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'])
+        found = store.read(keys.values())
+        skipped = {i for i, k in keys.items() if skips(found[k])}
+        while more := {i for i in keys if i not in skipped and any(p.get('sourceId') in skipped and not p.get('spawn') for p in nodes[i]['params'].values())}:
+            skipped |= more
+        return keys, {i: found[k] is not None for i, k in keys.items()}, skipped
+
+    async def stored(self, request):
+        """ours: POST an exported graph ({nodes}); answers {keys: {id: key or null}, skipped: [id]}, the key each node is
+        stored under (none for one skipped) and the nodes a run skips, by the check a run starts with, running nothing,
+        so the canvas shows what the store holds when a graph opens or an edit moves a key, and no result of another key. With {sid, paths, show}, the nodes in show that are stored then draw
+        their results on that canvas, unless a task runs (its own do)"""
+        graph = await request.json()
+        keys, stored, skipped = await asyncio.to_thread(self.check, graph['nodes'])
+        stored = {i: stored[i] and i not in skipped for i in keys}  # one skipped has no outputs to show
+        if graph.get('sid') and graph.get('show') and not self.current_task and not self.queued_tasks:
+            self.showing = asyncio.create_task(asyncio.to_thread(self.show, graph, keys, stored))
+        return web.json_response({"keys": {i: keys[i] if stored[i] else None for i in keys}, "skipped": sorted(skipped)})
+
+    def show(self, graph, keys, stored):
+        """ours: each stored node in show, in the paths' order, goes through execute_node as a run that finds it stored
+        does: nothing runs, its outputs are its stored refs and its results go to the canvas (update_value, /cache)"""
+        for id in dict.fromkeys(i for path in graph['paths'] for i in path):
+            if stored.get(id) and id in graph['show']:
+                try:
+                    self.execute_node(id, graph['nodes'][id], graph['sid'], quiet=True, keys=keys)
+                except Exception as e:  # a node it links from never ran here: its results wait for a run
+                    logger.debug(f"Results of {id} not shown: {type(e).__name__}: {e}")
+
     def execute_graph(self, graph):
+        with telemetry.timed(telemetry.graph_s, outcome="failed") as run:  # ours: the run's seconds
+            run["outcome"] = self._execute_graph(graph)  # done, or stopped
+
+    def _execute_graph(self, graph):
         sid = graph['sid']
         nodes = graph['nodes']
         paths = graph['paths']
+        with telemetry.timed(telemetry.store_s, op="check"):  # ours: the run's check, its keys and whether each is stored
+            keys, stored, skipped = self.check(nodes)
+            status = self.tasks[self.current_task['task_id']] = {"state": "running", "error": None, "nodes": {i: {"key": k, "stored": stored[i]} for i, k in keys.items()}}
+        # ours: a post that runs a node placed elsewhere (a render) is kept as a saved graph, the canvas as it was run,
+        # beside the composition it was opened from, at its first spawn (a skipped render keeps nothing); its keys find
+        # its takes (/renders), and its outcome is written into it as the run ends
+        kept = {}
 
+        def keep():
+            kept.update(ref=render_path(graph.get('saved'), time.time()), record={**graph['canvas'], 'keys': keys})
+            kept['etag'] = store.save_graph(kept['ref'], json.dumps(kept['record']).encode(), None)
+        self.keep_render = keep if graph.get('canvas') and store.fs else None
+        outcome = {"state": "failed", "error": None}
+        try:
+            stopped = self._execute_paths(sid, paths, nodes, keys, status, skipped)  # ours: whether Stop left nodes unrun
+            outcome["state"] = status["state"] = "stopped" if stopped else "done"  # ours: a run Stop ended isn't done
+        except Exception as e:
+            status.update(state="failed", error=f"{type(e).__name__}: {e}")
+            outcome["error"] = str(e.__context__ or e)  # what the canvas shows of it ('failed')
+            raise
+        finally:
+            if kept:
+                store.save_graph(kept['ref'], json.dumps({**kept['record'], 'outcome': outcome}).encode(), kept['etag'])
+        return status["state"]
+
+    class NotRun(Exception):
+        """Ours: a node not run, as a node it links from failed or the run was stopped."""
+
+    keeping = threading.Lock()  # ours: keep_render's, taken at a spawn, which a render's own thread makes
+
+    def _execute_paths(self, sid, paths, nodes, keys, status, skipped):
+        """Ours: each node once. A placed node not stored runs on a thread of its own as soon as the nodes it links
+        from are done, at most remote.IN_FLIGHT spawned at once, so a graph's renders are in flight together; every
+        other node runs here, in the paths' order, once the nodes it links from are done. A piece carried on from the
+        one before links from it, so it waits for it. What the nodes it links from did decides, in one walk, what a
+        node does: if one failed, it isn't run, and nor is any node after it; if a non-spawn input links a skipped
+        one, it is skipped too (not run, spawned or stored), and is said so as soon as that one is, as are those the check
+        found skipped as the run starts; a spawn input leaves skipped ones out. Every render is
+        waited for before the first error is raised, so one that fails leaves the others' takes stored and shown."""
         graph_execution_time = time.time()
+        order = list(dict.fromkeys(i for path in paths for i in path))
+        links = {i: [(p['sourceId'], bool(p.get('spawn'))) for p in nodes[i]['params'].values() if p.get('sourceId') in order] for i in order}
+        # ours: level by level, how many links from a source, in the paths' order within one (which has each node after
+        # those it links from), so a node runs as soon as they have: a lane's Piece right after Plan, before the lanes
+        level = {}
+        for i in order:
+            level[i] = 1 + max((level[s] for s, _ in links[i]), default=-1)
+        order.sort(key=level.get)
+        placed = [i for i in order if not status['nodes'].get(i, {}).get('stored') and placement.get(nodes[i]['params'].get('repo_id', {}).get('value'))]
+        done = {i: Future() for i in order if i not in placed}  # each node's status once done, or why it isn't
+        finished, progress, in_flight = [0], threading.Lock(), threading.Semaphore(remote.IN_FLIGHT)
+        running = self.current_task['running'] if self.current_task else {}  # ours: for a page opened mid-run (/queue)
+        skipping, skips_lock = {i for i in order if i in skipped}, threading.Lock()  # ours: the nodes skipped, each said so once
+        for i in order:  # the check's: stored so, or after one that is
+            if i in skipping:
+                self.queue_message({"type": "skipped", "node": i}, sid)
 
-        node_count = sum(len(path) for path in paths)
-        task_progress_step = 100 / node_count if node_count > 0 else 100
-        task_progress = 0
+        def skip(id):
+            """ours: a skipped node and every node after it by non-spawn links are skipped at once, so the canvas hides
+            a lane past the plan as soon as its Piece node is skipped, not as the run reaches the lane"""
+            with skips_lock:
+                new, frontier = [], {id} - skipping
+                while frontier:
+                    skipping.update(frontier)
+                    new += [i for i in order if i in frontier]
+                    frontier = {i for i in order if i not in skipping and any(s in frontier and not spawn for s, spawn in links[i])}
+            for i in new:
+                self.queue_message({"type": "skipped", "node": i}, sid)
 
-        for path in paths:
-            for id in path:
-                if self.interrupt_flag:
-                    self.interrupt_flag = False
-                    self.queue_message({
-                        "type": "graph_stopped",
-                        "sid": sid,
-                        "message": "Execution interrupted by the user."
-                    }, sid)
-                    return
+        def run(id, skipped):
+            running[id] = True
+            try:
+                return self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes, skipped=skipped)
+            finally:
+                running.pop(id, None)
 
-                self.execute_node(id, nodes[id], sid)
+        def execute(id):
+            if id in skipping:  # ours: skipped already, by a node before it, so it waits for none
+                status['nodes'][id] = {"key": keys[id], "stored": False, "skipped": True}
+            elif failed := list(dict.fromkeys(s for s, _ in links[id] if done[s].exception() is not None)):  # waits for them
+                raise self.NotRun(f"Not run: {', '.join(failed)}, which it links from, did not run")
+            elif any(s in skipping and not spawn for s, spawn in links[id]):
+                status['nodes'][id] = {"key": keys[id], "stored": False, "skipped": True}  # not run, spawned or stored
+            else:
+                repo_id = nodes[id]['params'].get('repo_id', {}).get('value')  # each node's seconds, by folder and outcome
+                with telemetry.timed(telemetry.node_s, folder=repo_id or f"{nodes[id]['module']}.{nodes[id]['action']}", outcome="failed") as timing:
+                    if id in placed:
+                        with in_flight:
+                            if self.interrupt_flag:
+                                raise self.NotRun("Not run: stopped before it was spawned")
+                            status['nodes'][id] = run(id, skipping)
+                    else:
+                        status['nodes'][id] = run(id, skipping)
+                    ran = (status['nodes'][id] or {}).get('ran', True)
+                    timing['outcome'] = "skipped" if (status['nodes'][id] or {}).get('skipped') else ("remote" if placement.get(repo_id) else "ran") if ran else "stored"
+            if (status['nodes'][id] or {}).get('skipped'):
+                skip(id)
+            if self.current_task:  # broadcast the task progress
+                with progress:
+                    finished[0] += 1
+                    self.current_task['progress'] = int(100 * finished[0] / len(order))
+                self.queue_message({
+                    "type": "task_progress",
+                    "task_id": self.current_task["task_id"],
+                    "progress": self.current_task['progress'],
+                })
+            return status['nodes'][id]
 
-                # broadcast the task progress
-                if self.current_task:
-                    task_progress += task_progress_step
-                    self.current_task['progress'] = int(task_progress)
-                    self.queue_message({
-                        "type": "task_progress",
-                        "task_id": self.current_task["task_id"],
-                        "progress": self.current_task['progress'],
-                    })
+        with ThreadPoolExecutor(max(len(placed), 1), thread_name_prefix="placed") as pool:
+            for i in placed:  # in order, so each node it links from has its future when its thread looks
+                done[i] = pool.submit(execute, i)
+            for id in order:
+                if id in placed:
+                    continue
+                try:
+                    if self.interrupt_flag:
+                        raise self.NotRun("Not run: stopped")
+                    done[id].set_result(execute(id))
+                except Exception as e:
+                    done[id].set_exception(e)
+        failed = {i: done[i].exception() for i in order if done[i].exception() is not None}
+        for i, e in failed.items():
+            logger.error(f"Node {i} ({nodes[i]['module']}.{nodes[i]['action']}): {type(e).__name__}: {e}")
+            if not isinstance(e, self.NotRun):  # ours: the canvas shows which node failed and why (NodeBase wraps the why)
+                self.queue_message({"type": "failed", "node": i, "error": str(e.__context__ or e)}, sid)
+
+        # ours: a run Stop left nodes of is stopped, and says which; one it came too late for ends as it would have
+        stopped = self.interrupt_flag and [i for i, e in failed.items() if isinstance(e, self.NotRun)]
+        self.interrupt_flag = False
+        if stopped:
+            self.queue_message({
+                "type": "graph_stopped",
+                "sid": sid,
+                "message": "Execution interrupted by the user.",
+                "not_run": stopped,  # ours: the nodes it left unrun
+            }, sid)
+            return True  # ours: stopped
+        if errors := [e for e in failed.values() if not isinstance(e, self.NotRun)]:
+            raise errors[0]
 
         # the graph has completed
         self.queue_message({
@@ -943,12 +1208,15 @@ class WebServer:
         self.interrupt_flag = True
 
         # set the interrupt flag for all the nodes in the cache
-        for node in self.node_cache:
-            self.node_cache[node]._interrupt = True
+        for node in list(self.node_cache.values()):  # ours: a copy, as a placed node's thread may add one meanwhile
+            node._interrupt = True
+
+        task_list, current_task = self._get_queue()  # ours: every page shows the task stopping after what runs now
+        self.queue_message({"type": "task_stopping", "queued": task_list, "current": current_task})
         
         return web.json_response({"error": False, "message": "Execution set for interruption."})
 
-    def execute_node(self, id, node, sid, quiet=False):
+    def execute_node(self, id, node, sid, quiet=False, keys=None, nodes=None, skipped=()):
         module = node['module']
         action = node['action']
         params = node['params']
@@ -979,7 +1247,8 @@ class WebServer:
                     spawn_key = p.split('>>>')[0]
                     if not spawn_key in args:
                         args[spawn_key] = []
-
+                    if data_source_id in skipped:  # ours
+                        continue
                     args[spawn_key].append(self.node_cache[data_source_id].output[data_param_key])
                 else:
                     args[p] = self.node_cache[data_source_id].output[data_param_key]
@@ -1010,15 +1279,40 @@ class WebServer:
         # set the session id, it can be used to send messages from the node back to the client
         self.node_cache[id]._sid = sid
 
+        # ours: a Dynamic Block node's fields are its class's and its folder's config's (previews, /cache, the store)
+        node = self.node_cache[id]
+        fields = node._fields = {**self.modules[module][action]['params'], **(node._get_custom_config(args['repo_id']).node_params['custom']['params'] if hasattr(node, '_get_custom_config') else {})}
+
+        # ours: a node stored under its key is not run, here or on any machine sharing the store, but shows its previews
+        key = keys[id] if keys else None
+        refs = store.refs(key) if key else None
+        place = placement.get(params.get('repo_id', {}).get('value')) if key and nodes and refs is None else None
+        if place:  # ours: a node placed elsewhere (nodes.json) runs there, and its outputs are read from the store
+            with self.keeping:  # renders spawn from threads of their own: the first to spawn keeps the render, once
+                keep, self.keep_render = getattr(self, 'keep_render', None), None
+            if keep:
+                keep()
+            remote.run(place, id, nodes, keys, revisions[params['repo_id']['value']], lambda: self.interrupt_flag)
+            refs = store.refs(key)
+            if refs is None:
+                raise RuntimeError(f"{place} ran node {id} but stored no outputs")
+        if refs is not None:
+            node.output = refs  # read from the store only where it is used: by a node that runs here, or /cache
+            node.params = {}  # its outputs are another key's: NodeBase's memo, by node id, must not answer a later run with them
+            self.queue_message({"type": "executed", "node": id, "name": f"{module}.{action}", "stored": True}, sid)
+        else:
+            args = {p: store.resolve(v) for p, v in args.items()}  # ours: each {"file": ref} as a path on this machine
+
         # *** execute the node ***
         try:
-            self.node_cache[id](**args)
+            if refs is None:  # ours
+                self.node_cache[id](**args)
         except Exception as e:
             logger.error(f"Error executing node {id} ({module}.{action})")
             logger.error(traceback.format_exc())
             raise e
 
-        if not quiet:
+        if not quiet and refs is None:  # ours
             execution_time = time.time() - start_time
             self.node_cache[id]._execution_time['last'] = execution_time
             self.node_cache[id]._execution_time['min'] = min(self.node_cache[id]._execution_time['min'], execution_time) if self.node_cache[id]._execution_time['min'] is not None else execution_time
@@ -1044,7 +1338,7 @@ class WebServer:
             message = None
 
             # skip for button and group fields
-            if self.modules[module][action]['params'][ui_key].get('display') in ['ui_button', 'ui_group']:
+            if fields[ui_key].get('display') in ['ui_button', 'ui_group']:  # ours: fields, a Dynamic Block node's own
                 continue
 
             else:
@@ -1056,11 +1350,12 @@ class WebServer:
                 else:
                     continue
                         
-            data_type = self.modules[module][action]['params'][data_key].get('type') # data type of the source field
-            data_format = self.modules[module][action]['params'][ui_key].get('type', 'text') # format of the returned value: text, raw, url
-            fieldOptions = self.modules[module][action]['params'][ui_key].get('fieldOptions', {})
+            data_type = fields[data_key].get('type') # data type of the source field
+            data_format = fields[ui_key].get('type', 'text') # format of the returned value: text, raw, url
+            fieldOptions = fields[ui_key].get('fieldOptions', {})
 
             source_value = source_value if isinstance(source_value, list) else [source_value]
+            source_value = source_value if data_format == 'url' else store.resolve(source_value)  # ours: /cache reads a url's
             if data_format == 'url':
                 if data_type == 'image':
                     data_value = [f"/cache/{id}/{data_key}/{i}?format={fieldOptions.get('format', 'WEBP')}&quality={fieldOptions.get('quality', 100)}&t={time.time()}"
@@ -1084,6 +1379,22 @@ class WebServer:
 
             if message:
                 self.queue_message(message, sid)
+
+        # ours: a node that ran here and set none of its declared outputs has nothing to do: it is skipped, not stored
+        declared = [n for n, f in fields.items() if f.get('display') == 'output' and n != 'doc']
+        if refs is None and declared and all(self.node_cache[id].output.get(n) is None for n in declared):
+            # stored so, every output null: its key is its inputs', so it is skipped again (a lane past the plan)
+            stored = store.put(key, dict.fromkeys(declared), {}) if key else None
+            return {"key": key, "stored": stored is not None, "ran": True, "skipped": True}
+        # ours: store the outputs under the node's key; a Dynamic Block node declares its outputs in its folder's config
+        if not key:
+            return None
+        if refs is not None:
+            return {"key": key, "stored": True, "ran": bool(place), "outputs": refs}
+        output = self.node_cache[id].output
+        repo_id = params.get('repo_id', {}).get('value')
+        stored = store.put(key, output, fields, library_entry(params, revisions.get(repo_id), CONFIG.paths['work_dir'], output))  # ours: a source node is in its folder's library
+        return {"key": key, "stored": stored is not None, "ran": True, "outputs": stored}
 
 
     def trigger_node(self, source_id, output, sid):
@@ -1188,10 +1499,12 @@ class WebServer:
         logger.debug(f"Websocket connection opened: {sid}")
 
         # Update the session id in all cached nodes
-        for node in self.node_cache:
+        for node in list(self.node_cache):  # ours: a copy, as a placed node's thread may add one meanwhile
             # check if the node has a _sid attribute
             if hasattr(self.node_cache[node], '_sid') and self.node_cache[node]._sid != sid:
                 self.node_cache[node]._sid = sid
+        if self.current_task:  # ours: and the running task's messages, which its page's /queue then finds running
+            self.current_task['sid'] = sid
 
         # send the welcome message together with the ids of the cached nodes
         await self.broadcast({"type": "welcome", "instance": self.instance, "sid": sid, "cachedNodes": list(self.node_cache.keys())}, sid)
@@ -1265,7 +1578,13 @@ class WebServer:
                 logger.error(f"[Websocket] Error broadcasting message: {e}")
                 pass
     
+    def reporting(self, sid):
+        """Ours: the page a run's messages go to, the one that last connected while it runs, for the page it was posted from."""
+        task = self.current_task
+        return task['sid'] if task and sid is not None and sid == task.get('run_sid') else sid
+
     def queue_message(self, message: dict | bytes, sid: list[str] | str = None, exclude: list[str] | str = None):
+        sid = self.reporting(sid)  # ours: a run's messages follow the page that last connected
         if self.loop.is_running() and not self._shutdown_event.is_set():
             asyncio.run_coroutine_threadsafe(
                 self.background_queue.put((self.broadcast, (message, sid, exclude))),
@@ -1273,6 +1592,7 @@ class WebServer:
             )
     
     def get_signal_value(self, node: str, field: str, sid: str, timeout: int = 2):
+        sid = self.reporting(sid)  # ours: a run's messages follow the page that last connected
         try:
             if not sid or sid not in self.ws_sessions or self.ws_sessions[sid].closed:
                 return { '__MELLON_ERROR': 'invalid_sid' }

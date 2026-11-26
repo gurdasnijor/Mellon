@@ -1,0 +1,1 @@
+import{u as i}from"./index.js";function c(t,a,u){return i(n=>{if(!a||!t)return;const r=n.edges.find(e=>e.target===t&&e.targetHandle===a),o=r&&n.nodes.find(e=>e.id===r.source);return o?Object.values(o.data.params).find(e=>e.dataSource===r.sourceHandle&&e.display===u)?.value:void 0})}export{c as u};

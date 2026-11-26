@@ -21,6 +21,8 @@ data/graphs/*
 
 web/user/*
 !web/user/ExampleField.js
+# ours: the client fork's custom fields, built
+!web/user/ClipRange.js
 
 .venv
 venv
