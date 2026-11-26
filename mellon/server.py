@@ -234,6 +234,8 @@ class WebServer:
                 "sid": self.current_task["sid"],
                 "started_at": self.current_task["started_at"],
                 "progress": self.current_task["progress"],
+                "running": list(self.current_task.get("running", ())),  # ours: its nodes running now, and whether Stop
+                "stopping": self.interrupt_flag,  # was pressed: a page opened mid-run shows both, Stop's "stopping after"
             }
         
         return queued_tasks, current_task
@@ -329,7 +331,11 @@ class WebServer:
                         "task_id": task_id,
                         "task": task,
                         "name": current_task["name"],
-                        "sid": current_task["sid"],
+                        # ours: the page it reports to, the one it was posted from or, if that has gone (a reload while
+                        # it was queued), the one that connected last; run_sid, the page it was posted from
+                        "sid": current_task["sid"] if current_task["sid"] in self.ws_sessions else next(reversed(self.ws_sessions), current_task["sid"]),
+                        "run_sid": current_task["sid"],
+                        "running": {},  # ours: its nodes running now, in the order they started
                         "started_at": time.time(),
                         "progress": 0,
                         "args": args,
@@ -1029,8 +1035,7 @@ class WebServer:
 
     def execute_graph(self, graph):
         with telemetry.timed(telemetry.graph_s, outcome="failed") as run:  # ours: the run's seconds
-            self._execute_graph(graph)
-            run["outcome"] = "done"
+            run["outcome"] = self._execute_graph(graph)  # done, or stopped
 
     def _execute_graph(self, graph):
         sid = graph['sid']
@@ -1043,11 +1048,12 @@ class WebServer:
         # beside the composition it was opened from, at its first spawn (a skipped render keeps nothing); its keys find its takes
         self.keep_render = (lambda: store.save_graph(render_path(graph.get('saved'), time.time()), json.dumps({**graph['canvas'], 'keys': keys}).encode(), None)) if graph.get('canvas') and store.fs else None  # and its keys, which find its videos (/renders)
         try:
-            self._execute_paths(sid, paths, nodes, keys, status)
+            stopped = self._execute_paths(sid, paths, nodes, keys, status)  # ours: whether Stop left nodes unrun
         except Exception as e:
             status.update(state="failed", error=f"{type(e).__name__}: {e}")
             raise
-        status["state"] = "done"
+        status["state"] = "stopped" if stopped else "done"  # ours: a run Stop ended isn't done
+        return status["state"]
 
     class NotRun(Exception):
         """Ours: a node not run, as a node it links from failed or the run was stopped."""
@@ -1068,6 +1074,14 @@ class WebServer:
         placed = [i for i in order if not status['nodes'].get(i, {}).get('stored') and placement.get(nodes[i]['params'].get('repo_id', {}).get('value'))]
         done = {i: Future() for i in order if i not in placed}  # each node's status once done, or why it isn't
         finished, progress, in_flight = [0], threading.Lock(), threading.Semaphore(remote.IN_FLIGHT)
+        running = self.current_task['running'] if self.current_task else {}  # ours: for a page opened mid-run (/queue)
+
+        def run(id, skipped):
+            running[id] = True
+            try:
+                return self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes, skipped=skipped)
+            finally:
+                running.pop(id, None)
 
         def execute(id):
             if failed := list(dict.fromkeys(s for s, _ in links[id] if done[s].exception() is not None)):  # waits for them
@@ -1082,9 +1096,9 @@ class WebServer:
                         with in_flight:
                             if self.interrupt_flag:
                                 raise self.NotRun("Not run: stopped before it was spawned")
-                            status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes, skipped=skipped)
+                            status['nodes'][id] = run(id, skipped)
                     else:
-                        status['nodes'][id] = self.execute_node(id, nodes[id], sid, keys=keys, nodes=nodes, skipped=skipped)
+                        status['nodes'][id] = run(id, skipped)
                     ran = (status['nodes'][id] or {}).get('ran', True)
                     timing['outcome'] = "skipped" if (status['nodes'][id] or {}).get('skipped') else ("remote" if placement.get(repo_id) else "ran") if ran else "stored"
             if (status['nodes'][id] or {}).get('skipped'):
@@ -1118,14 +1132,17 @@ class WebServer:
             if not isinstance(e, self.NotRun):  # ours: the canvas shows which node failed and why (NodeBase wraps the why)
                 self.queue_message({"type": "failed", "node": i, "error": str(e.__context__ or e)}, sid)
 
-        if self.interrupt_flag:
-            self.interrupt_flag = False
+        # ours: a run Stop left nodes of is stopped, and says which; one it came too late for ends as it would have
+        stopped = self.interrupt_flag and [i for i, e in failed.items() if isinstance(e, self.NotRun)]
+        self.interrupt_flag = False
+        if stopped:
             self.queue_message({
                 "type": "graph_stopped",
                 "sid": sid,
-                "message": "Execution interrupted by the user."
+                "message": "Execution interrupted by the user.",
+                "not_run": stopped,  # ours: the nodes it left unrun
             }, sid)
-            return
+            return True  # ours: stopped
         if errors := [e for e in failed.values() if not isinstance(e, self.NotRun)]:
             raise errors[0]
 
@@ -1149,6 +1166,9 @@ class WebServer:
         # set the interrupt flag for all the nodes in the cache
         for node in list(self.node_cache.values()):  # ours: a copy, as a placed node's thread may add one meanwhile
             node._interrupt = True
+
+        task_list, current_task = self._get_queue()  # ours: every page shows the task stopping after what runs now
+        self.queue_message({"type": "task_stopping", "queued": task_list, "current": current_task})
         
         return web.json_response({"error": False, "message": "Execution set for interruption."})
 
@@ -1437,6 +1457,8 @@ class WebServer:
             # check if the node has a _sid attribute
             if hasattr(self.node_cache[node], '_sid') and self.node_cache[node]._sid != sid:
                 self.node_cache[node]._sid = sid
+        if self.current_task:  # ours: and the running task's messages, which its page's /queue then finds running
+            self.current_task['sid'] = sid
 
         # send the welcome message together with the ids of the cached nodes
         await self.broadcast({"type": "welcome", "instance": self.instance, "sid": sid, "cachedNodes": list(self.node_cache.keys())}, sid)
@@ -1510,7 +1532,13 @@ class WebServer:
                 logger.error(f"[Websocket] Error broadcasting message: {e}")
                 pass
     
+    def reporting(self, sid):
+        """Ours: the page a run's messages go to, the one that last connected while it runs, for the page it was posted from."""
+        task = self.current_task
+        return task['sid'] if task and sid is not None and sid == task.get('run_sid') else sid
+
     def queue_message(self, message: dict | bytes, sid: list[str] | str = None, exclude: list[str] | str = None):
+        sid = self.reporting(sid)  # ours: a run's messages follow the page that last connected
         if self.loop.is_running() and not self._shutdown_event.is_set():
             asyncio.run_coroutine_threadsafe(
                 self.background_queue.put((self.broadcast, (message, sid, exclude))),
@@ -1518,6 +1546,7 @@ class WebServer:
             )
     
     def get_signal_value(self, node: str, field: str, sid: str, timeout: int = 2):
+        sid = self.reporting(sid)  # ours: a run's messages follow the page that last connected
         try:
             if not sid or sid not in self.ws_sessions or self.ws_sessions[sid].closed:
                 return { '__MELLON_ERROR': 'invalid_sid' }
