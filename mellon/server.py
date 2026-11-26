@@ -984,14 +984,15 @@ class WebServer:
         return keys, {i: found[k] is not None for i, k in keys.items()}
 
     async def stored(self, request):
-        """ours: POST an exported graph ({nodes}); answers {id: stored} by the check a run starts with, running nothing,
-        so the canvas shows what the store holds when a graph opens or an edit moves a key. With {sid, paths, show},
-        the nodes in show that are stored then draw their results on that canvas, unless a task runs (its own do)"""
+        """ours: POST an exported graph ({nodes}); answers {id: key or null}, the key each node is stored under, by the
+        check a run starts with, running nothing, so the canvas shows what the store holds when a graph opens or an edit
+        moves a key, and no result of another key. With {sid, paths, show}, the nodes in show that are stored then draw
+        their results on that canvas, unless a task runs (its own do)"""
         graph = await request.json()
         keys, stored = await asyncio.to_thread(self.check, graph['nodes'])
         if graph.get('sid') and graph.get('show') and not self.current_task and not self.queued_tasks:
             self.showing = asyncio.create_task(asyncio.to_thread(self.show, graph, keys, stored))
-        return web.json_response(stored)
+        return web.json_response({i: keys[i] if stored.get(i) else None for i in keys})
 
     def show(self, graph, keys, stored):
         """ours: each stored node in show, in the paths' order, goes through execute_node as a run that finds it stored
