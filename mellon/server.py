@@ -985,9 +985,23 @@ class WebServer:
 
     async def stored(self, request):
         """ours: POST an exported graph ({nodes}); answers {id: stored} by the check a run starts with, running nothing,
-        so the canvas shows what the store holds when a graph opens or an edit moves a key"""
-        nodes = (await request.json())['nodes']
-        return web.json_response((await asyncio.to_thread(self.check, nodes))[1])
+        so the canvas shows what the store holds when a graph opens or an edit moves a key. With {sid, paths, show},
+        the nodes in show that are stored then draw their results on that canvas, unless a task runs (its own do)"""
+        graph = await request.json()
+        keys, stored = await asyncio.to_thread(self.check, graph['nodes'])
+        if graph.get('sid') and graph.get('show') and not self.current_task and not self.queued_tasks:
+            self.showing = asyncio.create_task(asyncio.to_thread(self.show, graph, keys, stored))
+        return web.json_response(stored)
+
+    def show(self, graph, keys, stored):
+        """ours: each stored node in show, in the paths' order, goes through execute_node as a run that finds it stored
+        does: nothing runs, its outputs are its stored refs and its results go to the canvas (update_value, /cache)"""
+        for id in dict.fromkeys(i for path in graph['paths'] for i in path):
+            if stored.get(id) and id in graph['show']:
+                try:
+                    self.execute_node(id, graph['nodes'][id], graph['sid'], quiet=True, keys=keys)
+                except Exception as e:  # a node it links from never ran here: its results wait for a run
+                    logger.debug(f"Results of {id} not shown: {type(e).__name__}: {e}")
 
     def execute_graph(self, graph):
         with telemetry.timed(telemetry.graph_s, outcome="failed") as run:  # ours: the run's seconds
