@@ -6,10 +6,8 @@ A call that failed is forgotten, so the next post spawns another."""
 
 import os
 import time
-from copy import deepcopy
-from pathlib import Path
 
-from mellon.store import file_here, store
+from mellon.store import store
 from mellon.telemetry import remote_s, timed
 
 WAIT = 10  # seconds between looks at whether the server was asked to stop
@@ -32,21 +30,7 @@ def upstream(nodes: dict, node_id: str) -> list[str]:
     return order
 
 
-def stored_inputs(value, key: str, name: str, work_dir: Path, index):
-    """A param's value with each file on this machine it names (those the key hashes) put in the store under the
-    node's key and named by its ref, so the host it runs on reads it."""
-    if isinstance(value, list):
-        return [stored_inputs(v, key, name, work_dir, index) for v in value]
-    path = file_here(value, work_dir)
-    if path is None:
-        return value
-    ref = f"nodes/{key}/inputs/{name}/{next(index)}{path.suffix}"
-    store.fs.makedirs(os.path.dirname(f"{store.root}/{ref}"), exist_ok=True)
-    store.fs.put_file(str(path), f"{store.root}/{ref}")
-    return {"file": ref}
-
-
-def run(place: str, node_id: str, nodes: dict, keys: dict, revision: str, work_dir, stopped) -> None:
+def run(place: str, node_id: str, nodes: dict, keys: dict, revision: str, stopped) -> None:
     """Runs a placed node where it is placed and waits for its outputs in the store. Raises if the call failed, or
     if the server was asked to stop: the call goes on, and its outputs are there for the next post."""
     import modal
@@ -66,14 +50,8 @@ def run(place: str, node_id: str, nodes: dict, keys: dict, revision: str, work_d
     else:
         if missing:
             raise RuntimeError(f"Run {', '.join(missing)} first: {place} reads them from the store")
-        node = deepcopy(nodes[node_id])
-        index = iter(range(1 << 30))
-        with timed(remote_s, phase="inputs"):
-            for name, p in node["params"].items():
-                if not p.get("sourceId") and "value" in p:
-                    p["value"] = stored_inputs(p["value"], key, name, Path(work_dir), index)
         graph = {
-            "nodes": {**{i: nodes[i] for i in order}, node_id: node},
+            "nodes": {i: nodes[i] for i in order},
             "paths": [order],
             "keys": {i: keys[i] for i in order},
             "spawned": time.time(),  # the call's queue is its start less this, on two clocks NTP keeps together

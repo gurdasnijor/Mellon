@@ -1,4 +1,4 @@
-"""One node cache shared by every Mellon server that points at the same store. MELLON_STORE is a folder or an fsspec
+"""Ours: one node cache shared by every Mellon server that points at the same store. MELLON_STORE is a folder or an fsspec
 URL (s3://<bucket>/<prefix>, its endpoint and key in the environment). A node's outputs are nodes/<key>.json under it,
 its files under nodes/<key>/. A file in a value is {"file": "<ref>"}, a path under the root: one another program put
 there, or a stored node's own, such as nodes/<key>/depth_videos/0.mp4. MELLON_NODES names a JSON file of each node
@@ -33,9 +33,8 @@ RUNNER = {
 }  # where it runs, or a control on the node (the Library field), not what it makes
 MELLON = "mellon@5fd24292"  # the revision of a node that is not a folder: Mellon's own, at our fork's base
 FILES = ("video", "image", "file")
-# A file named by its content, and the name it came with: sha256:<hex>/<name>, kept at files/<hex>/<name>. A library
-# entry written before names were kept has sha256:<hex> alone, which keys the same and names no stored file.
-SHA256 = re.compile(r"sha256:([0-9a-f]{64})(?:/([^/]+))?")
+# A file named by its content, and the name it came with: sha256:<hex>/<name>, kept at files/<hex>/<name>
+SHA256 = re.compile(r"sha256:([0-9a-f]{64})/([^/]+)")
 
 
 # Seconds, from a store request's milliseconds to a render's minutes; bytes, from a key's JSON to a take (telemetry.py)
@@ -100,34 +99,22 @@ def content(value, work_dir: Path):
     return {"sha256": _hashes[seen]}
 
 
-def typed(value, kind: str | None):
-    """A value as DynamicBlockNode.execute casts it by its param's declared type, so 5 typed in the canvas, which it
-    posts as "5", keys as the 5 a graph loads; one that does not cast stays as sent."""
-    if kind not in ("int", "float") or value is None or isinstance(value, bool):
-        return value
-    try:
-        return int(value) if kind == "int" else float(value)
-    except (TypeError, ValueError):
-        return value
-
-
-def graph_keys(nodes: dict, revisions: dict, work_dir: str | Path = ".", types: dict | None = None) -> dict:
+def graph_keys(nodes: dict, revisions: dict, work_dir: str | Path = ".") -> dict:
     """Every node's key: SHA-256 of the JCS of {module, action, revision, params}; a link hashes its source's key, a
-    file named here hashes its content, and a value its folder declares int or float (types) hashes as cast."""
+    file named here hashes its content."""
     keys = {}
 
     def key(node_id):
         if node_id not in keys:
             node, params = nodes[node_id], {}
             repo_id = node["params"].get("repo_id", {}).get("value")
-            declared = (types or {}).get(repo_id, {})
             for name, p in node["params"].items():
                 if name in RUNNER or p.get("display", "").startswith("ui_"):
                     continue
                 params[name] = (
                     {"key": key(p["sourceId"]), "sourceKey": p["sourceKey"]}
                     if p.get("sourceId")
-                    else {"value": content(typed(p.get("value"), declared.get(name)), Path(work_dir))}
+                    else {"value": content(p.get("value"), Path(work_dir))}
                 )
             ours = repo_id in revisions  # a node of one of our folders keys as the Dynamic Block Node that runs it,
             body = {  # whichever sidebar entry made it (custom.H3's, or Dynamic Block Node's with the folder loaded)
@@ -226,12 +213,6 @@ class Store:
         self.files_url = os.environ.get("MELLON_STORE_FILES")  # s3://<bucket>/<prefix>: where put_file() puts files
         self._s3 = None
 
-    def exists(self, key: str) -> bool:
-        if not self.fs:
-            return False
-        with measured("exists"):
-            return self.fs.exists(f"{self.root}/nodes/{key}.json")
-
     def read(self, keys) -> dict:
         """Each key's stored outputs, or None where nothing is stored, in one pass: a GET per key, all at once. A
         graph's 18 entries took 0.5 s through s3fs and 0.4 s through a mounted bucket (a folder, as H3's container
@@ -267,7 +248,7 @@ class Store:
     def resolve(self, value):
         """A value with each {"file": ref} in it, and each file named by its content (sha256:<hex>/<name>), as a path
         on this machine, read from the store once."""
-        if isinstance(value, str) and (named := SHA256.fullmatch(value)) and named[2]:
+        if isinstance(value, str) and (named := SHA256.fullmatch(value)):
             value = {"file": f"files/{named[1]}/{named[2]}"}
         if isinstance(value, list):
             return [self.resolve(v) for v in value]
@@ -512,19 +493,12 @@ def revision(folder: Path) -> str:
     return digest.hexdigest()
 
 
-def numbers(folder: Path) -> dict:
-    """The params of a folder's node that execute casts to a number (int or float), which its key casts the same."""
-    config = folder / CONFIG
-    types = runs(json.loads(config.read_bytes()))["types"] if config.exists() else {}
-    return {name: kind for name, kind in types.items() if kind in ("int", "float")}
-
-
 if __name__ == "__main__":  # python mellon/store.py nodes.json blocks/*: the revisions, the rest of the file kept
     import sys
 
     out = Path(sys.argv[1])
     kept = json.loads(out.read_text()) if out.exists() else {}
-    nodes = {f: {"revision": revision(Path(f)), "types": numbers(Path(f))} for f in sys.argv[2:]}
+    nodes = {f: {"revision": revision(Path(f))} for f in sys.argv[2:]}
     out.write_text(json.dumps({**kept, "nodes": nodes}, indent=2) + "\n")
 
 store = Store(
@@ -533,7 +507,6 @@ store = Store(
 )
 _nodes = json.loads(Path(os.environ["MELLON_NODES"]).read_text()) if os.environ.get("MELLON_NODES") else {}
 revisions = {repo: n["revision"] for repo, n in _nodes.get("nodes", {}).items()}
-types = {repo: n.get("types", {}) for repo, n in _nodes.get("nodes", {}).items()}
 # Where a folder's node runs when not here: "modal:<app>/<class>", whose run_graph runs it (mellon/remote.py). Not in
 # a key, so moving a node between hosts never changes one.
 placement = _nodes.get("placement", {})

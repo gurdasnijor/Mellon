@@ -19,7 +19,7 @@ logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
-from mellon.store import store, revisions, types, graph_keys, placement, graph_path, Stale, library_entry, render_path, SHA256
+from mellon.store import store, revisions, graph_keys, placement, graph_path, Stale, library_entry, render_path, SHA256
 import os
 import tempfile
 from mellon import remote, telemetry
@@ -802,7 +802,7 @@ class WebServer:
             if not found:
                 return web.json_response({"error": f"The file {file} does not exist."}, status=404)
             return web.Response(body=found[0], content_type='application/json', headers={'ETag': found[1], 'Cache-Control': 'no-cache'})
-        if (named := SHA256.fullmatch(file)) and named[2]:  # ours: an upload or a library entry's file, from the store
+        if named := SHA256.fullmatch(file):  # ours: an upload or a library entry's file, from the store
             return self.stored_file(f"files/{named[1]}/{named[2]}")
 
         file_path = Path(file)
@@ -945,7 +945,7 @@ class WebServer:
             return web.json_response({"error": "Incorrect request, `file` is required."}, status=400)
         if file.startswith('store:nodes/'):  # ours
             return self.stored_file(file.removeprefix('store:'))
-        if (named := SHA256.fullmatch(file)) and named[2]:  # ours: an upload or a library entry's file
+        if named := SHA256.fullmatch(file):  # ours: an upload or a library entry's file
             return self.stored_file(f"files/{named[1]}/{named[2]}")
 
         file_path = Path(file)
@@ -1002,7 +1002,7 @@ class WebServer:
         """ours: every node's key, whether or not this server runs it (a file by its content), and whether it is stored,
         from every node's stored outputs read in one pass, which refs() then answers from"""
         with telemetry.timed(telemetry.store_s, op="keys"):
-            keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'], types)
+            keys = graph_keys(nodes, revisions, CONFIG.paths['work_dir'])
         found = store.read(keys.values())
         return keys, {i: found[k] is not None for i, k in keys.items()}
 
@@ -1228,7 +1228,7 @@ class WebServer:
                 keep, self.keep_render = getattr(self, 'keep_render', None), None
             if keep:
                 keep()
-            remote.run(place, id, nodes, keys, revisions[params['repo_id']['value']], CONFIG.paths['work_dir'], lambda: self.interrupt_flag)
+            remote.run(place, id, nodes, keys, revisions[params['repo_id']['value']], lambda: self.interrupt_flag)
             refs = store.refs(key)
             if refs is None:
                 raise RuntimeError(f"{place} ran node {id} but stored no outputs")
@@ -1274,7 +1274,7 @@ class WebServer:
             message = None
 
             # skip for button and group fields
-            if fields[ui_key].get('display') in ['ui_button', 'ui_group']:
+            if fields[ui_key].get('display') in ['ui_button', 'ui_group']:  # ours: fields, a Dynamic Block node's own
                 continue
 
             else:

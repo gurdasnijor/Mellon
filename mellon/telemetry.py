@@ -13,9 +13,8 @@ a failed export is the SDK's one logged error.
 - mellon.node.duration: one node of it, by folder and outcome (ran here, read from the store, or remote: run where
   nodes.json places it)
 - mellon.store.duration and mellon.store.size (store.py's): one operation on the store, by op (check, a run's keys and
-  whether each is stored; keys; read, a run's entries in one pass; exists, refs, resolve, put; inputs and marker, a
-  placed node's); the bytes moved
-- mellon.remote.duration: a placed node's call, by phase (check, inputs, spawn, wait; poll, the wait less the call's
+  whether each is stored; keys; read, a run's entries in one pass; refs, resolve, put); the bytes moved
+- mellon.remote.duration: a placed node's call, by phase (check, spawn, wait; poll, the wait less the call's
   own queue and run, as the call reports them)
 """
 
