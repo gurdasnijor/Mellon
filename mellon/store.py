@@ -5,7 +5,9 @@ there, or a stored node's own, such as nodes/<key>/depth_videos/0.mp4. MELLON_NO
 folder's revision, which `python mellon/store.py nodes.json blocks/*` writes, and where a folder's node runs if not
 here. A value naming a file on this machine, such as a file
 field's path under Mellon's work folder, keys by the file's content: the same path with other bytes is another key, and
-the same bytes under another name or on another host are the same one."""
+the same bytes under another name or on another host are the same one. An upload, and a file a library entry's node
+read, is put under files/<hex>/<name> and named sha256:<hex>/<name>, which keys as the file does and which any host
+reads it by."""
 
 import hashlib
 import json
@@ -31,7 +33,9 @@ RUNNER = {
 }  # where it runs, or a control on the node (the Library field), not what it makes
 MELLON = "mellon@5fd24292"  # the revision of a node that is not a folder: Mellon's own, at our fork's base
 FILES = ("video", "image", "file")
-SHA256 = re.compile(r"sha256:([0-9a-f]{64})")  # a file named by its content, as a library entry names it
+# A file named by its content, and the name it came with: sha256:<hex>/<name>, kept at files/<hex>/<name>. A library
+# entry written before names were kept has sha256:<hex> alone, which keys the same and names no stored file.
+SHA256 = re.compile(r"sha256:([0-9a-f]{64})(?:/([^/]+))?")
 
 
 # Seconds, from a store request's milliseconds to a render's minutes; bytes, from a key's JSON to a take (telemetry.py)
@@ -142,24 +146,39 @@ def graph_keys(nodes: dict, revisions: dict, work_dir: str | Path = ".", types: 
 
 def library_entry(params: dict, revision: str | None, work_dir: str | Path, outputs: dict) -> dict | None:
     """A stored node's library entry, if no link feeds it (a clip, a person): its folder, revision and params as its
-    key reads them, a file as sha256:<hex>, so writing them back into a node of that folder gives the same key and
-    so its stored result, even once the file is gone; and a name, an output's "name" if it has one."""
+    key reads them, a file on this machine as sha256:<hex>/<name>, so writing them back into a node of that folder gives
+    the same key and so its stored result, even once the file is gone; and a name, an output's "name" if it has one.
+    Its "files", those files' paths, are put in the store with it (Store.put) and not written in it."""
     folder = params.get("repo_id", {}).get("value")
     if not folder or any(p.get("sourceId") for p in params.values()):
         return None
 
+    files = []
+
     def named(value):
         if isinstance(value, list):
             return [named(v) for v in value]
-        return f"sha256:{value['sha256']}" if isinstance(value, dict) and set(value) == {"sha256"} else value
+        path = file_here(value, Path(work_dir))
+        if path is None:
+            return value
+        files.append(str(path))
+        return named_value(str(path))
 
     values = {
-        name: named(content(p.get("value"), Path(work_dir)))
+        name: named(p.get("value"))
         for name, p in params.items()
         if name not in RUNNER and name != "repo_id" and not p.get("display", "").startswith("ui_") and p.get("display") != "output"
     }
     name = next((v["name"] for v in outputs.values() if isinstance(v, dict) and isinstance(v.get("name"), str)), None)
-    return {"folder": folder, "revision": revision, "name": name, "params": values}
+    return {"folder": folder, "revision": revision, "name": name, "params": values, "files": files}
+
+
+def named_value(path: str, name: str | None = None) -> str:
+    """A file's name by its content and its own name (or the one given, an upload's), sha256:<hex>/<name>."""
+    name = PurePosixPath((name or Path(path).name).replace("\\", "/")).name
+    if name in ("", ".", ".."):
+        raise ValueError(f"No file name in {name!r}")
+    return f"sha256:{content(os.path.abspath(path), Path('/'))['sha256']}/{name}"
 
 
 class Stale(Exception):
@@ -246,7 +265,10 @@ class Store:
         return json.loads(data) if data is not None else None
 
     def resolve(self, value):
-        """A value with each {"file": ref} in it as a path on this machine, read from the store once."""
+        """A value with each {"file": ref} in it, and each file named by its content (sha256:<hex>/<name>), as a path
+        on this machine, read from the store once."""
+        if isinstance(value, str) and (named := SHA256.fullmatch(value)) and named[2]:
+            value = {"file": f"files/{named[1]}/{named[2]}"}
         if isinstance(value, list):
             return [self.resolve(v) for v in value]
         if isinstance(value, dict) and set(value) != {"file"}:
@@ -395,6 +417,17 @@ class Store:
         with open(path, "rb") as body:
             self._s3.put_object(Bucket=bucket, Key=f"{prefix}/{ref}", Body=body)
 
+    def put_named(self, path: str, name: str | None = None) -> str:
+        """A file put in the store by its content and name, files/<hex>/<name>, unless there already; its name there,
+        sha256:<hex>/<name>, which keys as the file did and which any host reads it by (an upload, a library entry's
+        input)."""
+        value = named_value(path, name)
+        named = SHA256.fullmatch(value)
+        ref = f"files/{named[1]}/{named[2]}"
+        if not self.fs.exists(f"{self.root}/{ref}"):
+            self.put_file(path, ref)
+        return value
+
     def put(self, key: str, outputs: dict, declared: dict, entry: dict | None = None) -> dict | None:
         """Files first, the marker last, then the node's library entry if it has one. None, and nothing stored, if an
         output is neither JSON nor a file on disk."""
@@ -429,6 +462,8 @@ class Store:
                 stored[name] = self._files(value, key, name, iter(range(1 << 30)))
         self.fs.pipe_file(f"{self.root}/nodes/{key}.json", json.dumps(stored).encode())
         if entry:
+            for path in entry.pop("files"):  # what the node read, so a pick of the entry has it on any host
+                self.put_named(path)
             self.fs.makedirs(f"{self.root}/libraries/{entry['folder']}", exist_ok=True)
             self.fs.pipe_file(f"{self.root}/libraries/{entry['folder']}/{key}.json", json.dumps(entry).encode())
         return stored

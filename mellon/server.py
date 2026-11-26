@@ -19,7 +19,9 @@ logger = logging.getLogger('mellon')
 
 from mellon.config import CONFIG
 from mellon.modelstore import modelstore
-from mellon.store import store, revisions, types, graph_keys, placement, graph_path, Stale, library_entry, render_path
+from mellon.store import store, revisions, types, graph_keys, placement, graph_path, Stale, library_entry, render_path, SHA256
+import os
+import tempfile
 from mellon import remote, telemetry
 from modules import MODULE_MAP
 telemetry.configure()  # ours: before the app is made, so aiohttp's instrumentation sees it
@@ -800,7 +802,9 @@ class WebServer:
             if not found:
                 return web.json_response({"error": f"The file {file} does not exist."}, status=404)
             return web.Response(body=found[0], content_type='application/json', headers={'ETag': found[1], 'Cache-Control': 'no-cache'})
-        
+        if (named := SHA256.fullmatch(file)) and named[2]:  # ours: an upload or a library entry's file, from the store
+            return self.stored_file(f"files/{named[1]}/{named[2]}")
+
         file_path = Path(file)
         if not file_path.is_absolute():
             file_path = Path(self.work_dir) / file_path
@@ -835,6 +839,17 @@ class WebServer:
         file = data.get('file')
         type = data.get('type', 'images')
         type = type if type in ['images', 'audio', 'videos', 'text', '3d'] else 'images'
+        if store.fs:  # ours: put in the store by its content and name, which any host reads it by
+            fd, part = tempfile.mkstemp(suffix=Path(file.filename).suffix)
+            try:
+                with open(fd, 'wb') as f:
+                    f.write(file.file.read())
+                return web.json_response({"error": False, "path": await asyncio.to_thread(store.put_named, part, file.filename)})
+            except Exception as e:
+                logger.error(f"Error storing file: {e}")
+                return web.json_response({"error": str(e)}, status=500)
+            finally:
+                os.remove(part)
         file_path = Path(self.data_dir) / type / file.filename
 
         if file_path.exists():
@@ -860,13 +875,19 @@ class WebServer:
         file = request.query.get('file')
         if not file:
             return web.json_response({"error": "Incorrect request, `file` is required."}, status=400)
-        
-        file_path = Path(file)
-        if not file_path.is_absolute():
-            file_path = Path(self.work_dir) / file_path
 
-        if not str(file_path).startswith(self.work_dir):
-            return web.json_response({"error": f"Cannot access paths outside of {self.work_dir}."}, status=403)
+        if SHA256.fullmatch(file):  # ours: an upload or a library entry's file, read from the store once
+            try:
+                file_path = Path(await asyncio.to_thread(store.resolve, file))
+            except FileNotFoundError:
+                return web.json_response({"error": f"The file {file} does not exist."}, status=404)
+        else:
+            file_path = Path(file)
+            if not file_path.is_absolute():
+                file_path = Path(self.work_dir) / file_path
+
+            if not str(file_path).startswith(self.work_dir):
+                return web.json_response({"error": f"Cannot access paths outside of {self.work_dir}."}, status=403)
 
         if not file_path.exists():
             return web.json_response({"error": f"The file {file} does not exist."}, status=404)
@@ -924,6 +945,8 @@ class WebServer:
             return web.json_response({"error": "Incorrect request, `file` is required."}, status=400)
         if file.startswith('store:nodes/'):  # ours
             return self.stored_file(file.removeprefix('store:'))
+        if (named := SHA256.fullmatch(file)) and named[2]:  # ours: an upload or a library entry's file
+            return self.stored_file(f"files/{named[1]}/{named[2]}")
 
         file_path = Path(file)
         if not file_path.is_absolute():
