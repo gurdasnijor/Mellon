@@ -1081,6 +1081,12 @@ class WebServer:
         graph_execution_time = time.time()
         order = list(dict.fromkeys(i for path in paths for i in path))
         links = {i: [(p['sourceId'], bool(p.get('spawn'))) for p in nodes[i]['params'].values() if p.get('sourceId') in order] for i in order}
+        # ours: level by level, how many links from a source, in the paths' order within one (which has each node after
+        # those it links from), so a node runs as soon as they have: a lane's Piece right after Plan, before the lanes
+        level = {}
+        for i in order:
+            level[i] = 1 + max((level[s] for s, _ in links[i]), default=-1)
+        order.sort(key=level.get)
         placed = [i for i in order if not status['nodes'].get(i, {}).get('stored') and placement.get(nodes[i]['params'].get('repo_id', {}).get('value'))]
         done = {i: Future() for i in order if i not in placed}  # each node's status once done, or why it isn't
         finished, progress, in_flight = [0], threading.Lock(), threading.Semaphore(remote.IN_FLIGHT)
