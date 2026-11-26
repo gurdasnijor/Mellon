@@ -463,6 +463,11 @@ class Store:
         return {"file": ref}
 
 
+def skips(outputs: dict | None) -> bool:
+    """Whether a node's stored outputs say it is skipped: every one null, as the server stores a node that set none."""
+    return bool(outputs) and all(v is None for v in outputs.values())
+
+
 CONFIG = "mellon_pipeline_config.json"
 
 
