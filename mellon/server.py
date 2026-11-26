@@ -1091,6 +1091,8 @@ class WebServer:
         failed = {i: done[i].exception() for i in order if done[i].exception() is not None}
         for i, e in failed.items():
             logger.error(f"Node {i} ({nodes[i]['module']}.{nodes[i]['action']}): {type(e).__name__}: {e}")
+            if not isinstance(e, self.NotRun):  # ours: the canvas shows which node failed and why (NodeBase wraps the why)
+                self.queue_message({"type": "failed", "node": i, "error": str(e.__context__ or e)}, sid)
 
         if self.interrupt_flag:
             self.interrupt_flag = False
